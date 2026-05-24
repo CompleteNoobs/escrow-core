@@ -11,7 +11,9 @@ const RESERVATION_TTL_MIN = parseInt(process.env.RESERVATION_TTL_MIN || '5', 10)
 const RESERVATION_PER_ACCOUNT_MAX = parseInt(process.env.RESERVATION_PER_ACCOUNT_MAX || '3', 10);
 const DISK_LIMIT_GB = parseFloat(process.env.DISK_LIMIT_GB || '5');
 const DISK_LIMIT_BYTES = Math.floor(DISK_LIMIT_GB * 1024 * 1024 * 1024);
-const DEFAULT_TTL_DAYS = parseInt(process.env.DEFAULT_TTL_DAYS || '7', 10);
+// parseFloat so operators can set fractional days for testing sweeper expiry
+// (e.g. DEFAULT_TTL_DAYS=0.001 ≈ 86 seconds). Set 7+ for production.
+const DEFAULT_TTL_DAYS = parseFloat(process.env.DEFAULT_TTL_DAYS || '7');
 const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '10', 10);
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
