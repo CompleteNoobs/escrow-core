@@ -197,13 +197,11 @@ function validateTransferPayload(payload, { sender, expectedMemo }) {
       { code: 'unprocessable_entity' }
     );
   }
-  // Sanity check the from field matches required_auths sender (defence-in-depth)
-  if ((payload.from || '').toLowerCase() !== sender.toLowerCase()) {
-    throw Object.assign(
-      new Error(`payload.from ${payload.from} doesn't match sender ${sender}`),
-      { code: 'unprocessable_entity' }
-    );
-  }
+  // NOTE: Hive-Engine's tokens/transfer contractPayload has no `from` field —
+  // the sender is implicit in the wrapping custom_json's required_auths, which
+  // extractTokenTransferOp() already validates against `expectedSender`. A
+  // redundant `payload.from` check here always fails for real transfers (the
+  // field is always undefined) and was a v0.1.1 first-test bug.
   return { paid, currency: payload.symbol };
 }
 
