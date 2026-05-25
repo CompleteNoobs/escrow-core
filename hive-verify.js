@@ -11,6 +11,7 @@ const HIVE_NODE_FALLBACK = [
 ];
 
 const HIVE_ENGINE_API = 'https://api.hive-engine.com/rpc/contracts';
+const HIVE_ENGINE_BLOCKCHAIN_API = 'https://api.hive-engine.com/rpc/blockchain';
 
 const IPFS_GATE_HIVE_ACCOUNT = (process.env.IPFS_GATE_HIVE_ACCOUNT || '').toLowerCase();
 const PAYMENT_CURRENCY = process.env.PAYMENT_CURRENCY || 'CNOOBS';
@@ -206,6 +207,78 @@ function validateTransferPayload(payload, { sender, expectedMemo }) {
 }
 
 /**
+ * Hive-Engine sidechain transaction lookup.
+ * Polls api.hive-engine.com/rpc/blockchain getTransactionInfo until the tx
+ * either appears with success/failure info or the retry budget is exhausted.
+ *
+ * Why we need this: Hive Keychain reports success on Hive-layer broadcast
+ * regardless of whether the wrapped Hive-Engine custom_json action will be
+ * accepted by the sidechain. An under-balanced or otherwise-invalid token
+ * transfer broadcasts fine but is rejected when the sidechain processes it.
+ * The legacy balance check (compare ipfs-gate balance to claimed amount) is
+ * useless here: the existing escrow balance already exceeds the per-payment
+ * amount, so the check passes even when 0 actually landed.
+ *
+ * Returns:
+ *   { confirmed: true,  logs: '{}'  }                              accepted
+ *   { confirmed: false, reason: 'rejected', errors: [...], logs }  sidechain rejected
+ *   { confirmed: false, reason: 'pending',  logs: null }           not yet processed
+ *
+ * Throws only on RPC/network failure after exhausting retries.
+ */
+async function verifyHiveEngineSidechain(txId, {
+  retries = PAYMENT_VERIFY_RETRIES,
+  delayMs = PAYMENT_VERIFY_DELAY_MS
+} = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(HIVE_ENGINE_BLOCKCHAIN_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', method: 'getTransactionInfo',
+          params: { txid: txId }, id: 1
+        }),
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!res.ok) {
+        lastErr = new Error(`Hive-Engine blockchain HTTP ${res.status}`);
+      } else {
+        const data = await res.json();
+        if (data.error) {
+          lastErr = new Error(`Hive-Engine blockchain: ${JSON.stringify(data.error)}`);
+        } else if (data.result === null) {
+          // Not yet processed by the sidechain — retry
+          if (attempt < retries - 1) await sleep(delayMs);
+          continue;
+        } else {
+          // Result present. Inspect logs for errors.
+          const logsRaw = data.result.logs || '{}';
+          let logsObj = {};
+          try { logsObj = JSON.parse(logsRaw); } catch (_) {}
+          if (Array.isArray(logsObj.errors) && logsObj.errors.length > 0) {
+            return {
+              confirmed: false,
+              reason: 'rejected',
+              errors: logsObj.errors,
+              logs: logsRaw
+            };
+          }
+          return { confirmed: true, logs: logsRaw };
+        }
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < retries - 1) await sleep(delayMs);
+  }
+  if (lastErr) throw lastErr;
+  // Exhausted retries without success or error → still pending
+  return { confirmed: false, reason: 'pending', logs: null };
+}
+
+/**
  * Hive-Engine balance check for ipfs-gate's escrow account.
  * Returns balance as a Number (the token quantity).
  */
@@ -299,6 +372,7 @@ module.exports = {
   extractTokenTransferOp,
   validateTransferPayload,
   getHiveEngineBalance,
+  verifyHiveEngineSidechain,
   verifyPayment,
   sendRefund,
   // exposed for tests + caller convenience
