@@ -37,11 +37,29 @@ function runMigrations() {
   if (!fs.existsSync(migDir)) {
     throw new Error(`migrations directory not found: ${migDir}`);
   }
-  const files = fs.readdirSync(migDir).filter(f => f.endsWith('.sql')).sort();
+
+  // Version-aware runner (v0.2). Earlier versions re-exec'd every .sql on each
+  // boot and relied on IF NOT EXISTS — fine for CREATE TABLE, but ALTER TABLE
+  // ADD COLUMN throws on re-run. So each migration file is named `NNN_*.sql`
+  // and applied exactly once, gated on schema_version. 001 stays idempotent
+  // for fresh DBs; 002+ are ALTERs that must run only when newer than current.
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
+    version    INTEGER PRIMARY KEY,
+    applied_at INTEGER NOT NULL
+  );`);
+  const current = db.prepare('SELECT COALESCE(MAX(version), 0) AS v FROM schema_version').get().v;
+
+  const files = fs.readdirSync(migDir)
+    .filter(f => /^\d+_.*\.sql$/.test(f))
+    .sort();
   for (const f of files) {
+    const ver = parseInt(f.match(/^(\d+)/)[1], 10);
+    if (ver <= current) continue;
     const sql = fs.readFileSync(path.join(migDir, f), 'utf8');
     db.exec(sql);
+    console.log(`[quota] applied migration ${f}`);
   }
+
   const v = db.prepare('SELECT MAX(version) AS v FROM schema_version').get();
   console.log(`[quota] schema_version = ${v?.v ?? 'none'}`);
 }
@@ -111,9 +129,12 @@ function isCidBlocked(cid) {
  * Create a reservation atomically. Throws on quota/per-account/banned failure.
  * Returns { id, expires_at }.
  */
-function createReservation(uploader, sizeBytes) {
+function createReservation(uploader, sizeBytes, mode = 'encrypted') {
   if (!uploader || typeof uploader !== 'string') {
     throw Object.assign(new Error('uploader required'), { code: 'bad_request' });
+  }
+  if (mode !== 'encrypted' && mode !== 'public') {
+    throw Object.assign(new Error("mode must be 'encrypted' or 'public'"), { code: 'bad_request' });
   }
   if (!Number.isInteger(sizeBytes) || sizeBytes <= 0) {
     throw Object.assign(new Error('size_bytes must be a positive integer'), { code: 'bad_request' });
@@ -150,9 +171,9 @@ function createReservation(uploader, sizeBytes) {
     const expires_at = t + (RESERVATION_TTL_MIN * 60 * 1000);
 
     db.prepare(`
-      INSERT INTO reservations (id, uploader, size_bytes, created_at, expires_at, status)
-      VALUES (?, ?, ?, ?, ?, 'pending')
-    `).run(id, uploader, sizeBytes, t, expires_at);
+      INSERT INTO reservations (id, uploader, size_bytes, created_at, expires_at, status, mode)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    `).run(id, uploader, sizeBytes, t, expires_at, mode);
 
     return { id, expires_at };
   });
@@ -224,15 +245,50 @@ function markPaymentRefunded(paymentId, refundTxId) {
 
 // ─── Pins ───────────────────────────────────────────────────────────────────
 
-function createPin({ cid, uploader, size_bytes, payment_id, ttl_days }) {
+function createPin({ cid, uploader, size_bytes, payment_id, ttl_days, mode = 'encrypted', mime = null }) {
   const t = now();
   const days = ttl_days || DEFAULT_TTL_DAYS;
   const expires_at = t + (days * 24 * 60 * 60 * 1000);
   const result = db.prepare(`
-    INSERT INTO pins (cid, uploader, size_bytes, payment_id, created_at, expires_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, 'active')
-  `).run(cid, uploader, size_bytes, payment_id, t, expires_at);
+    INSERT INTO pins (cid, uploader, size_bytes, payment_id, created_at, expires_at, status, mode, mime)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run(cid, uploader, size_bytes, payment_id, t, expires_at, mode, mime);
   return { id: result.lastInsertRowid, expires_at };
+}
+
+/**
+ * Rendering info for a CID served over GET /ipfs/:cid. Returns the mode + mime
+ * of an active pin (most recently created wins; rows for the same CID agree in
+ * practice since identical bytes → identical CID). null when no active pin.
+ */
+function getServeInfoForCid(cid) {
+  return db.prepare(`
+    SELECT mode, mime FROM pins
+    WHERE cid = ? AND status = 'active'
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(cid) || null;
+}
+
+/**
+ * User-initiated delete of the caller's OWN pin(s) for a CID. Flips only the
+ * caller's active rows to 'expired' (status_reason='user_deleted'); other
+ * accounts' pins for the same CID are untouched. Quota frees automatically
+ * (getDiskUsage sums status='active'). Returns { removed, fully_unpinned }.
+ * fully_unpinned=true means no active pin remains → caller should kubo-unpin+GC.
+ */
+function removePinForUploader(cid, uploader) {
+  return db.transaction(() => {
+    const t = now();
+    const res = db.prepare(`
+      UPDATE pins SET status = 'expired', status_changed_at = ?, status_reason = 'user_deleted'
+      WHERE cid = ? AND uploader = ? AND status = 'active'
+    `).run(t, cid, uploader);
+    return {
+      removed: res.changes,
+      fully_unpinned: !hasActivePinForCid(cid)
+    };
+  }).immediate();
 }
 
 function getPinById(id) {
@@ -258,7 +314,7 @@ function getMaxExpiryForCid(cid) {
 function listUploadsForAccount(account, limit = 100, offset = 0) {
   return db.prepare(`
     SELECT p.id AS pin_id, p.cid, p.size_bytes, p.created_at, p.expires_at,
-           p.status, p.status_reason,
+           p.status, p.status_reason, p.mode, p.mime,
            py.tx_id, py.amount, py.currency
     FROM pins p
     JOIN payments py ON p.payment_id = py.id
@@ -344,6 +400,8 @@ module.exports = {
   getActivePinsForCid,
   hasActivePinForCid,
   getMaxExpiryForCid,
+  getServeInfoForCid,
+  removePinForUploader,
   listUploadsForAccount,
   countUploadsForAccount,
   // sweeper

@@ -366,8 +366,35 @@ async function sendRefund({ to, amount, currency, memo }) {
   );
 }
 
+/**
+ * Fetch an account's current POSTING public keys from Hive.
+ *
+ * The load-bearing identity control for the signed user endpoints
+ * (/uploads/by-user, /uploads/delete): those carry no on-chain payment to
+ * anchor identity the way /upload does, so the caller-supplied pubkey MUST be
+ * proven to belong to the claimed account. A signature alone only proves
+ * "whoever holds THIS key signed" — not that the key is the account's.
+ *
+ * Returns an array of STM-prefixed pubkey strings (the posting authority's
+ * key_auths). Returns [] if the account does not exist. Throws (network) only
+ * if every Hive node is unreachable — callers should fail closed on throw.
+ */
+async function getAccountPostingPubkeys(account) {
+  const acct = String(account || '').toLowerCase();
+  if (!/^[a-z0-9][a-z0-9.\-]*$/.test(acct)) {
+    throw Object.assign(new Error('invalid Hive account name'), { code: 'bad_request' });
+  }
+  const result = await hivePost('condenser_api.get_accounts', [[acct]]);
+  if (!Array.isArray(result) || result.length === 0) return [];
+  const posting = result[0] && result[0].posting;
+  const keyAuths = (posting && posting.key_auths) || [];
+  // key_auths is [[pubkey, weight], ...]; we only need the key strings.
+  return keyAuths.map(ka => ka[0]).filter(k => typeof k === 'string');
+}
+
 module.exports = {
   hivePost,
+  getAccountPostingPubkeys,
   getTransactionWithRetry,
   extractTokenTransferOp,
   validateTransferPayload,
