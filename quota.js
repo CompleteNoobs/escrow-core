@@ -364,10 +364,10 @@ function countUploadsForAccount(account) {
  * already exist (so we can link pin_id + payment_id). Returns { order_id, claim_id }.
  */
 function createOrderWithClaim({
-  cid, owner, pinId, paymentId,
+  cid, owner, pinId = null, paymentId,
   sizeBytes, sizeMB, rateLocked, paidHours, copies = 1,
   amountPaid, currency, startTs, expiryTs,
-  kind = 'original'
+  kind = 'original', state = 'active'
 }) {
   return db.transaction(() => {
     const t = now();
@@ -384,10 +384,10 @@ function createOrderWithClaim({
         (claim_id, order_id, cid, owner, host_gate, pin_id, size_bytes, size_mb,
          rate_locked, paid_hours, copies_requested, kind, state,
          amount_paid, currency, payment_id, start_ts, expiry_ts, created_ts)
-      VALUES (?, ?, ?, ?, 'self', ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 'self', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       claimId, orderId, cid, owner, pinId, sizeBytes, sizeMB,
-      rateLocked, paidHours, copies, kind,
+      rateLocked, paidHours, copies, kind, state,
       amountPaid, currency, paymentId, startTs, expiryTs, t
     );
 
@@ -403,8 +403,86 @@ function getActiveClaimsForCid(cid) {
   return db.prepare("SELECT * FROM claims WHERE cid = ? AND state = 'active'").all(cid);
 }
 
+// FIFO order (by pledge time) — the head dormant backstop activates first.
+// rowid (insertion order) is the tiebreaker so two pledges in the same ms still
+// promote in the true order they were recorded.
+function getDormantBackstopsForCid(cid) {
+  return db.prepare(
+    "SELECT * FROM claims WHERE cid = ? AND state = 'dormant' AND kind = 'backstop' ORDER BY created_ts ASC, rowid ASC"
+  ).all(cid);
+}
+
 function listClaimsForOwner(owner) {
   return db.prepare('SELECT * FROM claims WHERE owner = ? ORDER BY created_ts DESC').all(owner);
+}
+
+// Most-recent pin row for a CID (active OR expired) — used to copy size/mode/mime
+// onto the new pin when a backstop is promoted (the bytes are still in Kubo).
+function getLatestPinInfoForCid(cid) {
+  return db.prepare(
+    'SELECT size_bytes, mode, mime FROM pins WHERE cid = ? ORDER BY created_at DESC LIMIT 1'
+  ).get(cid) || null;
+}
+
+/**
+ * Extend an ACTIVE claim: add hours at its OWN rate_locked, pushing expiry_ts +
+ * paid_hours, and keep the linked pin's expires_at in lockstep. Atomic + owner-
+ * checked + state-locked. Returns the updated claim. Throws not_found / forbidden
+ * / conflict. (cohosting §8 — extend/top-up is in v1.)
+ */
+function extendClaim(claimId, owner, extraHours) {
+  return db.transaction(() => {
+    const claim = getClaim(claimId);
+    if (!claim) throw Object.assign(new Error('claim not found'), { code: 'not_found' });
+    if (claim.owner !== owner) throw Object.assign(new Error('not your claim'), { code: 'forbidden' });
+    if (claim.state !== 'active') throw Object.assign(new Error(`claim is ${claim.state}, not active`), { code: 'conflict' });
+
+    const newPaidHours = claim.paid_hours + extraHours;
+    const newExpiry = claim.expiry_ts + extraHours * 60 * 60 * 1000;
+    db.prepare('UPDATE claims SET paid_hours = ?, expiry_ts = ? WHERE claim_id = ?')
+      .run(newPaidHours, newExpiry, claimId);
+    if (claim.pin_id) {
+      db.prepare("UPDATE pins SET expires_at = ? WHERE id = ? AND status = 'active'")
+        .run(newExpiry, claim.pin_id);
+    }
+    return getClaim(claimId);
+  }).immediate();
+}
+
+/**
+ * Reconcile a CID after one of its active claims ended (cohosting §5). MUST be
+ * called inside an open transaction (sweep / cancelClaim already are). Returns:
+ *   { unpin: bool, activated: claim_id|null }
+ *   - another active claim still funds it → { unpin:false, activated:null }
+ *   - no active claim BUT a dormant backstop queued → promote head (FIFO):
+ *     flip dormant→active, set start/expiry, create its pin → { unpin:false, activated }
+ *   - nothing left → { unpin:true, activated:null }  (caller kubo-unpins + GCs)
+ * The bytes stay in Kubo throughout — a promoted backstop reuses the existing
+ * physical pin (we never unpin a CID that still has a funder), so activation only
+ * writes DB rows, no re-pin.
+ */
+function reconcileCidAfterEnd(cid) {
+  if (hasActivePinForCid(cid)) return { unpin: false, activated: null };
+
+  const queue = getDormantBackstopsForCid(cid);
+  if (queue.length === 0) return { unpin: true, activated: null };
+
+  const next = queue[0];
+  const t = now();
+  const newExpiry = t + next.paid_hours * 60 * 60 * 1000;
+  const info = getLatestPinInfoForCid(cid) || { size_bytes: next.size_bytes, mode: 'encrypted', mime: null };
+
+  const pinRes = db.prepare(`
+    INSERT INTO pins (cid, uploader, size_bytes, payment_id, created_at, expires_at, status, mode, mime)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run(cid, next.owner, info.size_bytes, next.payment_id, t, newExpiry, info.mode || 'encrypted', info.mime || null);
+
+  db.prepare(`
+    UPDATE claims SET state = 'active', start_ts = ?, expiry_ts = ?, pin_id = ?
+    WHERE claim_id = ? AND state = 'dormant'
+  `).run(t, newExpiry, pinRes.lastInsertRowid, next.claim_id);
+
+  return { unpin: false, activated: next.claim_id };
 }
 
 /**
@@ -426,27 +504,36 @@ function cancelClaim(claimId, owner) {
     if (claim.owner !== owner) {
       throw Object.assign(new Error('not your claim'), { code: 'forbidden' });
     }
-    if (claim.state !== 'active') {
-      throw Object.assign(new Error(`claim is ${claim.state}, not active`), { code: 'conflict' });
+    if (claim.state !== 'active' && claim.state !== 'dormant') {
+      throw Object.assign(new Error(`claim is ${claim.state}, cannot cancel`), { code: 'conflict' });
     }
 
+    const wasDormant = claim.state === 'dormant';
     const t = now();
     const flip = db.prepare(`
-      UPDATE claims SET state = 'cancelled' WHERE claim_id = ? AND state = 'active'
+      UPDATE claims SET state = 'cancelled' WHERE claim_id = ? AND state IN ('active','dormant')
     `).run(claimId);
     if (flip.changes === 0) {
       // Lost the race to a concurrent cancel/sweep.
       throw Object.assign(new Error('claim already closed'), { code: 'conflict' });
     }
 
+    // A dormant backstop holds no pin and isn't keeping the file alive — nothing
+    // to expire or reconcile. Its refund is escrow-minus-fee (caller computes).
+    if (wasDormant) {
+      return { claim, fully_unpinned: false, activated: null, was_dormant: true };
+    }
+
+    // Active claim: expire its pin, then reconcile — a queued backstop may take
+    // the baton (FIFO) instead of the CID being unpinned.
     if (claim.pin_id) {
       db.prepare(`
         UPDATE pins SET status = 'expired', status_changed_at = ?, status_reason = 'claim_cancelled'
         WHERE id = ? AND status = 'active'
       `).run(t, claim.pin_id);
     }
-
-    return { claim, fully_unpinned: !hasActivePinForCid(claim.cid) };
+    const rec = reconcileCidAfterEnd(claim.cid);
+    return { claim, fully_unpinned: rec.unpin, activated: rec.activated, was_dormant: false };
   }).immediate();
 }
 
@@ -522,21 +609,27 @@ function sweep() {
       WHERE status = 'active' AND expires_at < ?
     `).run(t, t);
 
-    // Find CIDs touched this tick AND now with no remaining active pins.
+    // 3. Reconcile every CID touched this tick (cohosting §5): if a dormant
+    //    backstop is queued, promote it (FIFO) instead of unpinning. cids_to_unpin
+    //    ends up holding only the CIDs with no funder left at all.
     const candidates = db.prepare(`
       SELECT DISTINCT cid FROM pins
       WHERE status = 'expired' AND status_changed_at = ?
     `).all(t);
 
     const cidsToUnpin = [];
+    const activated = [];
     for (const { cid } of candidates) {
-      if (!hasActivePinForCid(cid)) cidsToUnpin.push(cid);
+      const rec = reconcileCidAfterEnd(cid);
+      if (rec.activated) activated.push(rec.activated);
+      else if (rec.unpin) cidsToUnpin.push(cid);
     }
 
     return {
       expired_reservations: expRes.changes,
       expired_claims: expiringClaims.length,
       expired_pins: expPin.changes,
+      activated_backstops: activated.length,
       cids_to_unpin: cidsToUnpin
     };
   }).immediate();
@@ -585,8 +678,12 @@ module.exports = {
   createOrderWithClaim,
   getClaim,
   getActiveClaimsForCid,
+  getDormantBackstopsForCid,
+  getLatestPinInfoForCid,
   listClaimsForOwner,
   cancelClaim,
+  extendClaim,
+  reconcileCidAfterEnd,
   // refund ledger
   recordRefund,
   markRefundSettled,

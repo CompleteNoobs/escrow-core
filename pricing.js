@@ -95,6 +95,21 @@ function calculateRefund(claim, now = Date.now()) {
   return { hours_used: hoursUsed, hours_refunded: hoursRefunded, amount: raw, dust: false };
 }
 
+/**
+ * Refund for a DORMANT backstop the pledger cancels before it ever activates.
+ * Full escrow back minus BACKSTOP_CANCEL_FEE_PCT (anti-churn; cohosting §3/§6).
+ * The fee applies ONLY to user-initiated dormant cancels — admin-forced voids
+ * pass feePct=0 (cohosting §7). Returns { amount, fee, dust }.
+ */
+function calculateDormantRefund(claim, feePct = BACKSTOP_CANCEL_FEE_PCT) {
+  const escrow = Number(claim.amount_paid);
+  if (!Number.isFinite(escrow) || escrow <= 0) return { amount: 0, fee: 0, dust: true };
+  const fee = roundCoins(escrow * (Math.max(0, feePct) / 100));
+  const amount = roundCoins(escrow - fee);
+  if (amount < MIN_REFUND) return { amount: 0, fee, dust: true };
+  return { amount, fee, dust: false };
+}
+
 module.exports = {
   billableMB,
   billableHours,
@@ -102,6 +117,7 @@ module.exports = {
   roundCoins,
   calculateCost,
   calculateRefund,
+  calculateDormantRefund,
   // constants (exposed for server.js + tests)
   RATE_PER_MB_HOUR,
   MIN_HOURS,
