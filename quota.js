@@ -74,6 +74,18 @@ function newReservationId() {
   return crypto.randomBytes(8).toString('hex');
 }
 
+function newOrderId() {
+  return 'ord_' + crypto.randomBytes(8).toString('hex');
+}
+
+function newClaimId() {
+  return 'clm_' + crypto.randomBytes(8).toString('hex');
+}
+
+function newRefundId() {
+  return 'rfd_' + crypto.randomBytes(8).toString('hex');
+}
+
 function getMemoForReservation(reservationId) {
   return `ipfs-gate:upload:${reservationId}`;
 }
@@ -129,7 +141,7 @@ function isCidBlocked(cid) {
  * Create a reservation atomically. Throws on quota/per-account/banned failure.
  * Returns { id, expires_at }.
  */
-function createReservation(uploader, sizeBytes, mode = 'encrypted') {
+function createReservation(uploader, sizeBytes, mode = 'encrypted', quote = {}) {
   if (!uploader || typeof uploader !== 'string') {
     throw Object.assign(new Error('uploader required'), { code: 'bad_request' });
   }
@@ -148,6 +160,13 @@ function createReservation(uploader, sizeBytes, mode = 'encrypted') {
   if (isAccountBanned(uploader)) {
     throw Object.assign(new Error('uploader is banned'), { code: 'forbidden' });
   }
+
+  // v1 claim model: the reservation carries the quote (hours/copies/amount) so
+  // /upload can validate paid ≥ quote and persist them onto the claim. Defaults
+  // keep this callable from any legacy code path that hasn't computed a quote.
+  const hoursRequested = Number.isFinite(quote.hoursRequested) ? Math.floor(quote.hoursRequested) : 0;
+  const copies = Number.isFinite(quote.copies) ? Math.floor(quote.copies) : 1;
+  const quotedAmount = Number.isFinite(quote.quotedAmount) ? quote.quotedAmount : 0;
 
   const tx = db.transaction(() => {
     const t = now();
@@ -171,9 +190,11 @@ function createReservation(uploader, sizeBytes, mode = 'encrypted') {
     const expires_at = t + (RESERVATION_TTL_MIN * 60 * 1000);
 
     db.prepare(`
-      INSERT INTO reservations (id, uploader, size_bytes, created_at, expires_at, status, mode)
-      VALUES (?, ?, ?, ?, ?, 'pending', ?)
-    `).run(id, uploader, sizeBytes, t, expires_at, mode);
+      INSERT INTO reservations
+        (id, uploader, size_bytes, created_at, expires_at, status, mode,
+         hours_requested, copies, quoted_amount)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+    `).run(id, uploader, sizeBytes, t, expires_at, mode, hoursRequested, copies, quotedAmount);
 
     return { id, expires_at };
   });
@@ -245,15 +266,17 @@ function markPaymentRefunded(paymentId, refundTxId) {
 
 // ─── Pins ───────────────────────────────────────────────────────────────────
 
-function createPin({ cid, uploader, size_bytes, payment_id, ttl_days, mode = 'encrypted', mime = null }) {
+function createPin({ cid, uploader, size_bytes, payment_id, ttl_days, expires_at = null, mode = 'encrypted', mime = null }) {
   const t = now();
-  const days = ttl_days || DEFAULT_TTL_DAYS;
-  const expires_at = t + (days * 24 * 60 * 60 * 1000);
+  // v1 claim model: the caller passes an explicit expires_at (the claim's
+  // expiry_ts, so the pin mirrors the lifecycle authority). Falls back to the
+  // legacy ttl_days computation when no explicit expiry is given.
+  const exp = (expires_at != null) ? expires_at : t + ((ttl_days || DEFAULT_TTL_DAYS) * 24 * 60 * 60 * 1000);
   const result = db.prepare(`
     INSERT INTO pins (cid, uploader, size_bytes, payment_id, created_at, expires_at, status, mode, mime)
     VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
-  `).run(cid, uploader, size_bytes, payment_id, t, expires_at, mode, mime);
-  return { id: result.lastInsertRowid, expires_at };
+  `).run(cid, uploader, size_bytes, payment_id, t, exp, mode, mime);
+  return { id: result.lastInsertRowid, expires_at: exp };
 }
 
 /**
@@ -329,12 +352,142 @@ function countUploadsForAccount(account) {
   return row.c;
 }
 
+// ─── Orders + Claims (v1 claim model) ───────────────────────────────────────
+// An ORDER is the user's intent ("keep this CID alive"); a CLAIM is one
+// (cid, host) hosting record with its own timer + locked rate + escrow. v1 is
+// always 1 order ⇒ 1 claim; the split is the v2 federation seam. The claim's
+// expiry_ts is the lifecycle authority — the pins row mirrors it (see §6 of
+// PRICING-V1-DESIGN-NOTES.md / cohosting §2).
+
+/**
+ * Create an order + its single claim atomically, after the pin + payment rows
+ * already exist (so we can link pin_id + payment_id). Returns { order_id, claim_id }.
+ */
+function createOrderWithClaim({
+  cid, owner, pinId, paymentId,
+  sizeBytes, sizeMB, rateLocked, paidHours, copies = 1,
+  amountPaid, currency, startTs, expiryTs,
+  kind = 'original'
+}) {
+  return db.transaction(() => {
+    const t = now();
+    const orderId = newOrderId();
+    const claimId = newClaimId();
+
+    db.prepare(`
+      INSERT INTO orders (order_id, cid, owner, created_ts, status)
+      VALUES (?, ?, ?, ?, 'open')
+    `).run(orderId, cid, owner, t);
+
+    db.prepare(`
+      INSERT INTO claims
+        (claim_id, order_id, cid, owner, host_gate, pin_id, size_bytes, size_mb,
+         rate_locked, paid_hours, copies_requested, kind, state,
+         amount_paid, currency, payment_id, start_ts, expiry_ts, created_ts)
+      VALUES (?, ?, ?, ?, 'self', ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+    `).run(
+      claimId, orderId, cid, owner, pinId, sizeBytes, sizeMB,
+      rateLocked, paidHours, copies, kind,
+      amountPaid, currency, paymentId, startTs, expiryTs, t
+    );
+
+    return { order_id: orderId, claim_id: claimId };
+  }).immediate();
+}
+
+function getClaim(claimId) {
+  return db.prepare('SELECT * FROM claims WHERE claim_id = ?').get(claimId);
+}
+
+function getActiveClaimsForCid(cid) {
+  return db.prepare("SELECT * FROM claims WHERE cid = ? AND state = 'active'").all(cid);
+}
+
+function listClaimsForOwner(owner) {
+  return db.prepare('SELECT * FROM claims WHERE owner = ? ORDER BY created_ts DESC').all(owner);
+}
+
+/**
+ * User-initiated early cancel of an ACTIVE claim. Atomic + status-locked so a
+ * double-click / concurrent cancel can't double-refund: the claim flips
+ * active→cancelled exactly once; a second attempt finds nothing to flip. Also
+ * expires the linked pin and reports whether the CID now has no active pin
+ * (caller kubo-unpins + GCs). Refund computation/broadcast happens in the
+ * caller AFTER this returns — safe because only one cancel wins the status lock.
+ *
+ * Returns { claim, fully_unpinned }. Throws not_found / forbidden / conflict.
+ */
+function cancelClaim(claimId, owner) {
+  return db.transaction(() => {
+    const claim = getClaim(claimId);
+    if (!claim) {
+      throw Object.assign(new Error('claim not found'), { code: 'not_found' });
+    }
+    if (claim.owner !== owner) {
+      throw Object.assign(new Error('not your claim'), { code: 'forbidden' });
+    }
+    if (claim.state !== 'active') {
+      throw Object.assign(new Error(`claim is ${claim.state}, not active`), { code: 'conflict' });
+    }
+
+    const t = now();
+    const flip = db.prepare(`
+      UPDATE claims SET state = 'cancelled' WHERE claim_id = ? AND state = 'active'
+    `).run(claimId);
+    if (flip.changes === 0) {
+      // Lost the race to a concurrent cancel/sweep.
+      throw Object.assign(new Error('claim already closed'), { code: 'conflict' });
+    }
+
+    if (claim.pin_id) {
+      db.prepare(`
+        UPDATE pins SET status = 'expired', status_changed_at = ?, status_reason = 'claim_cancelled'
+        WHERE id = ? AND status = 'active'
+      `).run(t, claim.pin_id);
+    }
+
+    return { claim, fully_unpinned: !hasActivePinForCid(claim.cid) };
+  }).immediate();
+}
+
+// ─── Refund ledger ──────────────────────────────────────────────────────────
+// Escrowed-but-owed money is a real custodial float; every refund is a durable
+// row so a pending/failed broadcast is visible + retryable, never silently lost.
+
+function recordRefund({ claim_id, to_account, amount, currency, memo, status = 'pending', reason = null, tx_id = null }) {
+  const id = newRefundId();
+  db.prepare(`
+    INSERT INTO refunds (refund_id, claim_id, to_account, amount, currency, memo, status, reason, tx_id, created_ts, settled_ts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id, claim_id, to_account, amount, currency, memo, status, reason, tx_id, now(),
+    (status === 'sent' || status === 'skipped' || status === 'failed') ? now() : null
+  );
+  return { refund_id: id };
+}
+
+function markRefundSettled(refundId, status, txId = null) {
+  return db.prepare(`
+    UPDATE refunds SET status = ?, tx_id = ?, settled_ts = ?
+    WHERE refund_id = ?
+  `).run(status, txId, now(), refundId);
+}
+
+function getRefund(refundId) {
+  return db.prepare('SELECT * FROM refunds WHERE refund_id = ?').get(refundId);
+}
+
 // ─── Sweeper helpers ────────────────────────────────────────────────────────
 
 /**
- * Expire stale pending reservations + active pins past TTL.
- * Returns { expired_reservations, expired_pins, cids_to_unpin }.
- * cids_to_unpin = CIDs where NO active pin remains; caller should kubo-unpin + GC.
+ * Expire stale pending reservations, expire CLAIMS past their timer (the v1
+ * lifecycle authority), and expire pins with no live funder. Returns
+ * { expired_reservations, expired_claims, expired_pins, cids_to_unpin }.
+ * cids_to_unpin = CIDs where NO active pin remains; caller kubo-unpins + GCs.
+ *
+ * Reconcile is the Stage-1a subset of cohosting §5: when an active claim ends,
+ * if no active claim remains the file is unpinned. (Stage 1b inserts the
+ * "promote the next dormant backstop instead of unpinning" branch here.)
  */
 function sweep() {
   const t = now();
@@ -344,12 +497,32 @@ function sweep() {
       WHERE status = 'pending' AND expires_at < ?
     `).run(t);
 
+    // 1. Expire claims whose timer ran out, then expire each linked pin.
+    const expiringClaims = db.prepare(`
+      SELECT claim_id, pin_id FROM claims WHERE state = 'active' AND expiry_ts < ?
+    `).all(t);
+    if (expiringClaims.length > 0) {
+      db.prepare(`
+        UPDATE claims SET state = 'expired' WHERE state = 'active' AND expiry_ts < ?
+      `).run(t);
+      const expirePin = db.prepare(`
+        UPDATE pins SET status = 'expired', status_changed_at = ?, status_reason = 'claim_expired'
+        WHERE id = ? AND status = 'active'
+      `);
+      for (const c of expiringClaims) {
+        if (c.pin_id) expirePin.run(t, c.pin_id);
+      }
+    }
+
+    // 2. Legacy/orphan pins (no claim, or pre-cutover rows) still expire by their
+    //    own clock. Claim-linked pins already flipped to 'expired' in #1, so the
+    //    status='active' filter naturally skips them — no double-touch.
     const expPin = db.prepare(`
       UPDATE pins SET status = 'expired', status_changed_at = ?
       WHERE status = 'active' AND expires_at < ?
     `).run(t, t);
 
-    // Find CIDs that just got expired AND have no remaining active pins.
+    // Find CIDs touched this tick AND now with no remaining active pins.
     const candidates = db.prepare(`
       SELECT DISTINCT cid FROM pins
       WHERE status = 'expired' AND status_changed_at = ?
@@ -362,6 +535,7 @@ function sweep() {
 
     return {
       expired_reservations: expRes.changes,
+      expired_claims: expiringClaims.length,
       expired_pins: expPin.changes,
       cids_to_unpin: cidsToUnpin
     };
@@ -376,6 +550,9 @@ module.exports = {
   // helpers
   now,
   newReservationId,
+  newOrderId,
+  newClaimId,
+  newRefundId,
   getMemoForReservation,
   parseMemoReservationId,
   // queries
@@ -404,6 +581,16 @@ module.exports = {
   removePinForUploader,
   listUploadsForAccount,
   countUploadsForAccount,
+  // orders + claims (v1 claim model)
+  createOrderWithClaim,
+  getClaim,
+  getActiveClaimsForCid,
+  listClaimsForOwner,
+  cancelClaim,
+  // refund ledger
+  recordRefund,
+  markRefundSettled,
+  getRefund,
   // sweeper
   sweep,
   // constants

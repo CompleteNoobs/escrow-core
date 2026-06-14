@@ -2,6 +2,8 @@
 // Implements Option C from the design: tx_id lookup on Hive +
 // Hive-Engine balance check belt-and-braces.
 
+const dhive = require('@hiveio/dhive');
+
 const HIVE_NODE_FALLBACK = [
   'https://api.hive.blog',
   'https://api.deathwing.me',
@@ -24,6 +26,15 @@ function getHiveNodes() {
   const override = (process.env.HIVE_API || '').trim();
   if (override) return [override, ...HIVE_NODE_FALLBACK];
   return HIVE_NODE_FALLBACK;
+}
+
+// Lazy dhive client for outbound broadcasts (refunds). Built once on first use
+// so `require('./hive-verify')` stays cheap for the pricing/lifecycle tests that
+// never broadcast anything.
+let _dhiveClient = null;
+function getDhiveClient() {
+  if (!_dhiveClient) _dhiveClient = new dhive.Client(getHiveNodes(), { timeout: 10000 });
+  return _dhiveClient;
 }
 
 function sleep(ms) {
@@ -169,7 +180,7 @@ function extractTokenTransferOp(tx, expectedSender) {
  * Validate a token transfer payload against the expected fields.
  * Throws with detailed code/message on any mismatch.
  */
-function validateTransferPayload(payload, { sender, expectedMemo }) {
+function validateTransferPayload(payload, { sender, expectedMemo, minAmount }) {
   if (!payload || typeof payload !== 'object') {
     throw Object.assign(new Error('invalid payload'), { code: 'unprocessable_entity' });
   }
@@ -185,10 +196,14 @@ function validateTransferPayload(payload, { sender, expectedMemo }) {
       { code: 'unprocessable_entity' }
     );
   }
+  // v1 claim model: the required amount is the per-claim QUOTE (size×time×copies),
+  // passed in as minAmount. Falls back to the legacy flat PAYMENT_AMOUNT when the
+  // caller didn't compute a quote (e.g. a legacy/test path).
+  const required = (minAmount !== undefined && minAmount !== null) ? Number(minAmount) : PAYMENT_AMOUNT;
   const paid = parseFloat(payload.quantity);
-  if (!Number.isFinite(paid) || paid < PAYMENT_AMOUNT) {
+  if (!Number.isFinite(paid) || paid < required) {
     throw Object.assign(
-      new Error(`underpaid: ${payload.quantity} (expected at least ${PAYMENT_AMOUNT} ${PAYMENT_CURRENCY})`),
+      new Error(`underpaid: ${payload.quantity} (expected at least ${required} ${PAYMENT_CURRENCY})`),
       { code: 'unprocessable_entity' }
     );
   }
@@ -310,7 +325,7 @@ async function getHiveEngineBalance(account, symbol) {
  * Throws with .code on any failure.
  * Returns { tx_id, sender, paid, currency, block_num } on success.
  */
-async function verifyPayment({ tx_id, sender, expectedMemo, expectedReservationBalanceFloor }) {
+async function verifyPayment({ tx_id, sender, expectedMemo, expectedAmount, expectedReservationBalanceFloor }) {
   if (!IPFS_GATE_HIVE_ACCOUNT) {
     throw new Error('IPFS_GATE_HIVE_ACCOUNT not configured');
   }
@@ -318,9 +333,11 @@ async function verifyPayment({ tx_id, sender, expectedMemo, expectedReservationB
   // Step 1: fetch transaction (with retries for block confirmation)
   const tx = await getTransactionWithRetry(tx_id);
 
-  // Step 2: extract + validate the tokens/transfer op
+  // Step 2: extract + validate the tokens/transfer op. expectedAmount = the
+  // per-claim quote the gate computed at /reserve (v1 claim model). When omitted,
+  // validateTransferPayload falls back to the legacy flat PAYMENT_AMOUNT.
   const payload = extractTokenTransferOp(tx, sender);
-  const { paid, currency } = validateTransferPayload(payload, { sender, expectedMemo });
+  const { paid, currency } = validateTransferPayload(payload, { sender, expectedMemo, minAmount: expectedAmount });
 
   // Step 3: optional sidechain confirmation via balance check.
   // Caller passes expectedReservationBalanceFloor = the minimum balance we
@@ -348,22 +365,63 @@ async function verifyPayment({ tx_id, sender, expectedMemo, expectedReservationB
 }
 
 /**
- * Issue a refund — send tokens from ipfs-gate's escrow back to a user.
- * Uses dhive to broadcast a custom_json with the active key.
+ * Issue a refund — send `amount` of `currency` from ipfs-gate's escrow back to
+ * `to`, signed with the escrow ACTIVE key (IPFS_GATE_ACTIVE_KEY). HIVE/HBD go
+ * out as a native `transfer`; everything else as a Hive-Engine `custom_json`
+ * tokens/transfer (`ssc-mainnet-hive`). Returns { tx_id, currency }.
  *
- * NOTE: signed broadcast is a v0.2 polish; for v0.1 we expose this stub
- * so the moderation + sweeper code can call it. Actual broadcast left as
- * TODO until the first refund flow is wired.
+ * Key-optional by design: if IPFS_GATE_ACTIVE_KEY is unset the gate still boots
+ * and runs — this throws `code:'no_refund_key'` so the caller records the refund
+ * `pending` for manual settlement (operator transfers + POST /admin/log-refund),
+ * exactly the pre-v1 behaviour. Network/broadcast failures throw normally so the
+ * caller can mark the refund `failed` and retry.
  */
 async function sendRefund({ to, amount, currency, memo }) {
-  // TODO v0.1: implement using @hiveio/dhive PrivateKey + Operation.custom_json
-  // For now, log + throw so a caller can choose to handle (e.g. mark refund
-  // 'failed' in DB and surface to operator for manual transfer).
-  console.warn(`[hive-verify] sendRefund stub: would send ${amount} ${currency} to @${to} memo "${memo}"`);
-  throw Object.assign(
-    new Error('sendRefund not yet implemented; operator must refund manually + POST /admin/log-refund'),
-    { code: 'not_implemented' }
-  );
+  const keyStr = (process.env.IPFS_GATE_ACTIVE_KEY || '').trim();
+  if (!keyStr) {
+    throw Object.assign(
+      new Error('IPFS_GATE_ACTIVE_KEY not set — refund recorded pending; operator must transfer manually + POST /admin/log-refund'),
+      { code: 'no_refund_key' }
+    );
+  }
+  const dest = String(to || '').toLowerCase();
+  const cur = String(currency || '').toUpperCase();
+  const amt = Number(amount);
+  if (!/^[a-z0-9][a-z0-9.\-]*$/.test(dest)) {
+    throw Object.assign(new Error(`invalid refund destination: ${to}`), { code: 'bad_request' });
+  }
+  if (!Number.isFinite(amt) || amt <= 0) {
+    throw Object.assign(new Error(`invalid refund amount: ${amount}`), { code: 'bad_request' });
+  }
+
+  const key = dhive.PrivateKey.fromString(keyStr);
+  const client = getDhiveClient();
+
+  let op;
+  if (cur === 'HIVE' || cur === 'HBD') {
+    // Native transfer — amount must carry 3-dp + the asset symbol.
+    op = ['transfer', {
+      from: IPFS_GATE_HIVE_ACCOUNT,
+      to: dest,
+      amount: `${amt.toFixed(3)} ${cur}`,
+      memo: memo || ''
+    }];
+  } else {
+    // Hive-Engine token transfer (sidechain) via custom_json, ACTIVE auth.
+    op = ['custom_json', {
+      required_auths: [IPFS_GATE_HIVE_ACCOUNT],
+      required_posting_auths: [],
+      id: 'ssc-mainnet-hive',
+      json: JSON.stringify({
+        contractName: 'tokens',
+        contractAction: 'transfer',
+        contractPayload: { symbol: cur, to: dest, quantity: String(amt), memo: memo || '' }
+      })
+    }];
+  }
+
+  const res = await client.broadcast.sendOperations([op], key);
+  return { tx_id: res.id, currency: cur };
 }
 
 /**
