@@ -367,7 +367,7 @@ function createOrderWithClaim({
   cid, owner, pinId = null, paymentId,
   sizeBytes, sizeMB, rateLocked, paidHours, copies = 1,
   amountPaid, currency, startTs, expiryTs,
-  kind = 'original', state = 'active'
+  kind = 'original', state = 'active', releasePolicy = null
 }) {
   return db.transaction(() => {
     const t = now();
@@ -375,9 +375,9 @@ function createOrderWithClaim({
     const claimId = newClaimId();
 
     db.prepare(`
-      INSERT INTO orders (order_id, cid, owner, created_ts, status)
-      VALUES (?, ?, ?, ?, 'open')
-    `).run(orderId, cid, owner, t);
+      INSERT INTO orders (order_id, cid, owner, release_policy, created_ts, status)
+      VALUES (?, ?, ?, ?, ?, 'open')
+    `).run(orderId, cid, owner, JSON.stringify(releasePolicy || { type: 'owner_only' }), t);
 
     db.prepare(`
       INSERT INTO claims
@@ -399,8 +399,59 @@ function getClaim(claimId) {
   return db.prepare('SELECT * FROM claims WHERE claim_id = ?').get(claimId);
 }
 
+function getOrder(orderId) {
+  return db.prepare('SELECT * FROM orders WHERE order_id = ?').get(orderId);
+}
+
+function getActiveClaimForOrder(orderId) {
+  return db.prepare("SELECT * FROM claims WHERE order_id = ? AND state = 'active'").get(orderId) || null;
+}
+
 function getActiveClaimsForCid(cid) {
   return db.prepare("SELECT * FROM claims WHERE cid = ? AND state = 'active'").all(cid);
+}
+
+// ─── Release consents (Stage 3) ─────────────────────────────────────────────
+// Idempotent per (order, releaser) — re-signing doesn't double-count.
+function recordReleaseConsent(orderId, releaser, sig = null) {
+  db.prepare(`
+    INSERT OR IGNORE INTO release_consents (order_id, releaser, consented_at, sig)
+    VALUES (?, ?, ?, ?)
+  `).run(orderId, String(releaser).toLowerCase(), now(), sig);
+}
+
+function getReleaseConsents(orderId) {
+  return db.prepare('SELECT releaser FROM release_consents WHERE order_id = ?')
+    .all(orderId).map(r => r.releaser);
+}
+
+/**
+ * End an ACTIVE claim because its release threshold was met (Stage 3). Same
+ * mechanics as a cancel — expire the pin, then reconcile so a queued backstop
+ * takes the baton (release ≠ deletion) — but NO owner check (the release policy,
+ * not ownership, authorised this; the server validates it before calling). The
+ * pro-rata refund to the owner is settled by the caller. Returns
+ * { claim, fully_unpinned, activated }.
+ */
+function endActiveClaimForRelease(claimId) {
+  return db.transaction(() => {
+    const claim = getClaim(claimId);
+    if (!claim) throw Object.assign(new Error('claim not found'), { code: 'not_found' });
+    if (claim.state !== 'active') throw Object.assign(new Error(`claim is ${claim.state}, not active`), { code: 'conflict' });
+
+    const t = now();
+    const flip = db.prepare("UPDATE claims SET state = 'cancelled' WHERE claim_id = ? AND state = 'active'").run(claimId);
+    if (flip.changes === 0) throw Object.assign(new Error('claim already closed'), { code: 'conflict' });
+
+    if (claim.pin_id) {
+      db.prepare(`
+        UPDATE pins SET status = 'expired', status_changed_at = ?, status_reason = 'released'
+        WHERE id = ? AND status = 'active'
+      `).run(t, claim.pin_id);
+    }
+    const rec = reconcileCidAfterEnd(claim.cid);
+    return { claim, fully_unpinned: rec.unpin, activated: rec.activated };
+  }).immediate();
 }
 
 // FIFO order (by pledge time) — the head dormant backstop activates first.
@@ -677,6 +728,8 @@ module.exports = {
   // orders + claims (v1 claim model)
   createOrderWithClaim,
   getClaim,
+  getOrder,
+  getActiveClaimForOrder,
   getActiveClaimsForCid,
   getDormantBackstopsForCid,
   getLatestPinInfoForCid,
@@ -684,6 +737,10 @@ module.exports = {
   cancelClaim,
   extendClaim,
   reconcileCidAfterEnd,
+  // release authority (Stage 3)
+  recordReleaseConsent,
+  getReleaseConsents,
+  endActiveClaimForRelease,
   // refund ledger
   recordRefund,
   markRefundSettled,
