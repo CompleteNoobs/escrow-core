@@ -110,6 +110,23 @@ function calculateDormantRefund(claim, feePct = BACKSTOP_CANCEL_FEE_PCT) {
   return { amount, fee, dust: false };
 }
 
+/**
+ * Refund amount for a claim ended by an ADMIN force-action (cohosting §7).
+ *   - innocent backstopper (CID ban voided an innocent third party's pledge)
+ *       → FULL escrow back, no fee.
+ *   - offender / banned-user's own claim, policy 'none'  → 0 (forfeit).
+ *   - offender / banned-user's own claim, policy 'prorata':
+ *       active  → pro-rata unused hours;  dormant → full escrow (never ran).
+ * `claim.state` is the PRE-VOID state (active|dormant). Returns a number.
+ */
+function forcedRefundAmount(claim, { policy = 'prorata', innocent = false } = {}, now = Date.now()) {
+  const wasDormant = claim.state === 'dormant';
+  if (innocent) return calculateDormantRefund(claim, 0).amount;   // full escrow, no fee
+  if (policy === 'none') return 0;                                // forfeit
+  if (wasDormant) return calculateDormantRefund(claim, 0).amount; // never metered → full back
+  return calculateRefund(claim, now).amount;                      // active offender → pro-rata
+}
+
 module.exports = {
   billableMB,
   billableHours,
@@ -118,6 +135,7 @@ module.exports = {
   calculateCost,
   calculateRefund,
   calculateDormantRefund,
+  forcedRefundAmount,
   // constants (exposed for server.js + tests)
   RATE_PER_MB_HOUR,
   MIN_HOURS,
