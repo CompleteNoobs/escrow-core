@@ -367,7 +367,7 @@ function createOrderWithClaim({
   cid, owner, pinId = null, paymentId,
   sizeBytes, sizeMB, rateLocked, paidHours, copies = 1,
   amountPaid, currency, startTs, expiryTs,
-  kind = 'original', state = 'active', releasePolicy = null
+  kind = 'original', state = 'active', releasePolicy = null, receiptHash = null
 }) {
   return db.transaction(() => {
     const t = now();
@@ -375,9 +375,9 @@ function createOrderWithClaim({
     const claimId = newClaimId();
 
     db.prepare(`
-      INSERT INTO orders (order_id, cid, owner, release_policy, created_ts, status)
-      VALUES (?, ?, ?, ?, ?, 'open')
-    `).run(orderId, cid, owner, JSON.stringify(releasePolicy || { type: 'owner_only' }), t);
+      INSERT INTO orders (order_id, cid, owner, release_policy, receipt_hash, created_ts, status)
+      VALUES (?, ?, ?, ?, ?, ?, 'open')
+    `).run(orderId, cid, owner, JSON.stringify(releasePolicy || { type: 'owner_only' }), receiptHash, t);
 
     db.prepare(`
       INSERT INTO claims
@@ -423,6 +423,22 @@ function recordReleaseConsent(orderId, releaser, sig = null) {
 function getReleaseConsents(orderId) {
   return db.prepare('SELECT releaser FROM release_consents WHERE order_id = ?')
     .all(orderId).map(r => r.releaser);
+}
+
+// ─── Receipts (Stage 6 — proof-of-receipt) ──────────────────────────────────
+// A receipt records that `recipient` reproduced SHA-256(plaintext) for this
+// order — i.e. actually decrypted the file. Idempotent per (order, recipient).
+// The endpoint separately bridges a verified receipt into a release consent.
+function recordReceipt(orderId, recipient, proofHash, sig = null) {
+  db.prepare(`
+    INSERT OR IGNORE INTO receipts (order_id, recipient, proof_hash, received_at, sig)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(orderId, String(recipient).toLowerCase(), proofHash, now(), sig);
+}
+
+function getReceipts(orderId) {
+  return db.prepare('SELECT recipient, proof_hash, received_at FROM receipts WHERE order_id = ?')
+    .all(orderId);
 }
 
 /**
@@ -740,6 +756,8 @@ module.exports = {
   // release authority (Stage 3)
   recordReleaseConsent,
   getReleaseConsents,
+  recordReceipt,
+  getReceipts,
   endActiveClaimForRelease,
   // refund ledger
   recordRefund,
