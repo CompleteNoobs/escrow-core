@@ -1,0 +1,17 @@
+{
+  "name": "escrow-core",
+  "version": "0.1.0",
+  "description": "Shared custodial-escrow library (engine) — on-chain payment verify + replay protection, custodial signer, metered → pro-rata refund, durable idempotent ledger, signed-condition release. Succeeds ipfs-gate v0.1.3 escrow; consumers pin @^0.1.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@hiveio/dhive": "^1.3.2",
+    "@noble/curves": "^1.9.7",
+    "better-sqlite3": "^11.3.0"
+  }
+}
