@@ -4,7 +4,7 @@ Shared **custodial-escrow library** (the engine): on-chain payment verify + repl
 metered → pro-rata refund, durable idempotent settlement/refund ledger, and signed-condition release. This is
 **code, not a running service** — the escrow deployments that depend on it pin a version (`escrow-core@^0.1`) and
 **do not fork**. Per-service differences (metering unit, release condition, precision, ledger columns) live in
-small **adapters**, never in `if (service === …)` branches.
+small **adapters**, never in `if (service === …)`  branches.
 
 - **Version:** 0.1.0  ·  **escrow report format:** escrow-protocol 0.1  ·  **succeeds ipfs-gate v0.1.3 escrow**
 - Distils the proven escrow logic from **ipfs-gate v0.1.3** (`pricing.js` / `hive-verify.js` / `quota.js` /
