@@ -1,0 +1,416 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= escrow-core — Build, Test, and Wire Up the Shared Money Engine =
+
+From CompleteNoobs
+
+This guide walks through '''escrow-core''' — the shared custodial-escrow '''library''' that handles on-chain Hive payment verification, replay protection, custodial disbursement, metered → pro-rata refunds, a durable idempotent ledger, and signed-condition release. It is the money engine behind v4call (and, as a golden reference, ipfs-gate).
+
+'''Read this carefully — escrow-core is the money.''' Unlike the other CompleteNoobs walkthroughs, this is '''not''' a "deploy a box on a VPS" guide, because escrow-core is '''code, not a running service'''. There is no Dockerfile, no HTTP listener, no port. You install it, run its tests, understand its API, and depend on it from a node (today, in-process; later, as an isolated box). This walkthrough is for the developer/operator who wants to reproduce, verify, and trust that engine before any real key touches it.
+
+'''Source code''': [https://github.com/CompleteNoobs/escrow-core https://github.com/CompleteNoobs/escrow-core]
+
+'''Version''': escrow-core 0.1.0 · escrow report format <code>escrow-protocol/0.1</code> · succeeds the escrow logic in ipfs-gate v0.1.3
+
+'''Source of truth''': <code>handover-decoupling.md</code> (§8 the data verdict, the spike result) and <code>handover-escrow-core.md</code> (the focused build brief) in the project root.
+
+'''End result''': escrow-core installed, its '''67 tests passing offline''', the API understood, and a clear picture of how v4call-node consumes it in-process today and how the isolated <code>v4call-escrow</code> box will consume it later.
+
+== Contents ==
+
+* [[#What_escrow-core_Is_(and_Is_Not)|1 What escrow-core Is (and Is Not)]]
+* [[#The_Two_Money_Invariants_(Never_Weaken_These)|2 The Two Money Invariants (Never Weaken These)]]
+* [[#What_You_Need|3 What You Need]]
+* [[#Step_1:_Get_the_Code|4 Step 1: Get the Code]]
+* [[#Step_2:_Install_Dependencies|5 Step 2: Install Dependencies]]
+* [[#Step_3:_Run_the_Test_Suite_(prove_the_engine)|6 Step 3: Run the Test Suite (prove the engine)]]
+* [[#Step_4:_Tour_the_API|7 Step 4: Tour the API]]
+* [[#Step_5:_Understand_the_Ledger_Schema|8 Step 5: Understand the Ledger Schema]]
+* [[#Step_6:_The_Adapter_—_the_Per-Service_Seam|9 Step 6: The Adapter — the Per-Service Seam]]
+* [[#Step_7:_A_Worked_Settlement_(min(usage,_deposit))|10 Step 7: A Worked Settlement (min(usage, deposit))]]
+* [[#Step_8:_How_v4call-node_Uses_It_In-Process_(today)|11 Step 8: How v4call-node Uses It In-Process (today)]]
+* [[#Step_9:_The_Isolated_Escrow_Box_(the_gated_next_phase)|12 Step 9: The Isolated Escrow Box (the gated next phase)]]
+* [[#Step_10:_The_TEST-Token_Dry-Run_(mandatory_before_prod)|13 Step 10: The TEST-Token Dry-Run (mandatory before prod)]]
+* [[#API_Reference|14 API Reference]]
+* [[#Common_Problems_and_Fixes|15 Common Problems and Fixes]]
+* [[#Quick_Reference|16 Quick Reference]]
+
+== What escrow-core Is (and Is Not) ==
+
+In the old world, v4call and ipfs-gate each had their own copy of "take an on-chain payment, hold it, meter usage, refund the rest, pay out the difference." That is the same custodial-escrow ''shape'' written twice. escrow-core is that shape, '''extracted once and audited once''', so both services share one trustworthy engine.
+
+{| class="wikitable"
+|-
+! escrow-core IS… !! escrow-core is NOT…
+|-
+| A '''library''' you <code>require('escrow-core')</code> || A server, daemon, or box you deploy
+|-
+| The audited money engine (verify · sign · settle · ledger · release) || A wallet or a key store (the secret key stays in the consumer's env)
+|-
+| Version-pinned by consumers (<code>escrow-core@^0.1</code>) || A thing consumers fork (per-service differences live in '''adapters''', not forks)
+|-
+| Built '''from ipfs-gate v0.1.3's proven escrow logic''' || Built by averaging two services as equals
+|}
+
+'''Why "from ipfs-gate, not averaged"''': the compatibility spike (handover §8) found that the shared ''shape'' holds for all five operations, but two money-safety invariants — replay protection and a durable idempotent ledger — existed in '''ipfs-gate only'''. v4call's old verify was a balance/history scan with no transaction id captured, its settlement state lived in memory (lost on restart), and its ledger writes weren't idempotent. So escrow-core is built to ipfs-gate's standard, and v4call is '''upgraded''' to that standard (see [[#Step_8:_How_v4call-node_Uses_It_In-Process_(today)|Step 8]]).
+
+'''Scope right now (owner decision)''': escrow-core ships with '''one adapter''' (<code>v4call</code>) and is built for '''v4call only''' for the moment. ipfs-gate stays the golden reference (the spec the tests are written against), '''not''' a live consumer yet.
+
+== The Two Money Invariants (Never Weaken These) ==
+
+Everything escrow-core does protects two rules. If you change code here, these must still hold — the tests exist to prove they do.
+
+# '''Replay protection.''' Every verified payment row carries <code>tx_id UNIQUE</code>. <code>recordPayment</code> '''throws <code>code:'conflict'</code>''' if a transaction id is reused. The same on-chain payment can never be counted, settled, or disbursed twice.
+# '''Settlement cap.''' <code>settle()</code> guarantees <code>settlement = min(meteredUsage, deposit)</code>. A wrong or over-stated usage report can only '''re-split the verified deposit, never mint money'''. And <code>atomicClose(ref)</code> flips a reference from <code>open</code> to <code>closed</code> exactly once (single-winner), so a crash or double-click can't double-disburse.
+
+Together these mean the worst a buggy or lying ''usage report'' can do is re-divide money that was actually escrowed on-chain — it can never create money. That bound is the whole point of the engine.
+
+== What You Need ==
+
+* '''A Linux/macOS dev box''' with a terminal. (Production money boxes are minimal Alpine — see [[#Step_9:_The_Isolated_Escrow_Box_(the_gated_next_phase)|Step 9]] — but you develop and test on a normal host.)
+* '''Node.js 18 or newer''' — <code>node --version</code>.
+* '''A C/C++ build toolchain''' — <code>better-sqlite3</code> is a native module compiled at install time. On Ubuntu: <code>apt install -y build-essential python3</code>. On macOS: Xcode command-line tools.
+* '''git''' and '''npm'''.
+
+You do '''not''' need a Hive account, a private key, or network access to install escrow-core or run its tests — the test suite is fully offline and mocked.
+
+== Step 1: Get the Code ==
+
+ git clone https://github.com/CompleteNoobs/escrow-core.git
+ cd escrow-core
+
+'''If you also run v4call-node''', clone escrow-core as a '''sibling''' of v4call-node so the node's <code>file:../escrow-core</code> dependency resolves:
+
+<pre>
+/opt/v4call/
+├── escrow-core/      ← this repo
+└── v4call-node/      ← depends on ../escrow-core
+</pre>
+
+The module map you'll see in the repo:
+
+<pre>
+index.js            — the public API surface (re-exports everything below)
+verify.js           — verifyPayment / verifySidechain (native HIVE/HBD + Hive-Engine token)
+sign.js             — disburse / buildDisburseOp (custodial payout)
+settle.js           — settle (the cap) / roundCoins / per-currency precision
+ledger.js           — openLedger: replay-guarded payments, atomicClose, refund/consent/receipt rows
+release.js          — evaluateRelease / normalizeReleasePolicy / verifyHiveSig
+escrow-protocol.js  — escrow-protocol/0.1: signed report + receipt payloads, memo grammar (NEW)
+adapter.js          — the EscrowAdapter contract + validateAdapter()
+adapters/v4call.js  — the v4call adapter (the only adapter today)
+migrations/001_escrow_core.sql — the core ledger tables
+test/*.test.js      — node --test, ipfs-gate behaviour as the spec
+</pre>
+
+== Step 2: Install Dependencies ==
+
+ npm install
+
+This pulls three dependencies and compiles the native SQLite module:
+
+{| class="wikitable"
+|-
+! Dependency !! Version !! Why
+|-
+| <code>better-sqlite3</code> || ^11.3.0 || The durable ledger (synchronous SQLite — the atomic single-winner guard depends on it)
+|-
+| <code>@hiveio/dhive</code> || ^1.3.2 || Hive RPC + ECDSA signature verification (release-consent layer)
+|-
+| <code>@noble/curves</code> || ^1.9.7 || schnorr / BIP340 signatures for the <code>escrow-protocol/0.1</code> report layer
+|}
+
+If the install errors on <code>better-sqlite3</code> (<code>node-gyp</code> / <code>make: not found</code>), install the build toolchain (see [[#What_You_Need|What You Need]]) and re-run.
+
+'''Note''' — if you're installing escrow-core alongside v4call-node, the node pins <code>better-sqlite3 ^9.x</code> while escrow-core pins <code>^11.x</code>, so you'll see the native module compile '''twice''' (once per repo, at different majors). That's expected and harmless on Node 20.
+
+== Step 3: Run the Test Suite (prove the engine) ==
+
+This is the single most important step. escrow-core's tests are written with '''ipfs-gate's proven behaviour as the specification''', and they run '''fully offline''' — no live Hive node, no env vars, no real keys (the on-chain transaction fetcher is injectable, so tests pass mock transactions; databases use <code>:memory:</code>).
+
+ npm test
+
+Under the hood this runs <code>node --test test/</code>. Expect '''67 passing''' assertions across 8 files:
+
+{| class="wikitable"
+|-
+! Test file !! What it proves
+|-
+| <code>verify.test.js</code> || On-chain verify (native + Hive-Engine), memo/account/amount/currency checks, tx-id-anchored, zero-network via injected fetcher
+|-
+| <code>ledger.test.js</code> || '''Replay protection''' (<code>tx_id UNIQUE</code> → <code>code:'conflict'</code>), <code>atomicClose</code> single-winner flip, idempotent consents/receipts
+|-
+| <code>settle.test.js</code> || '''The cap''' (<code>min(usage, deposit)</code>), per-currency precision, dust floor, ipfs-gate parity, non-3dp token rounding
+|-
+| <code>sign.test.js</code> || Disburse op-building (native <code>transfer</code> vs HE <code>custom_json</code> shapes), per-currency precision, <code>no_key</code> / <code>bad_request</code> guards (network-free)
+|-
+| <code>release.test.js</code> || Release-policy truth table (owner_only / any_of / all_of / duration_elapsed), Hive ECDSA verify (fail-closed)
+|-
+| <code>escrow-protocol.test.js</code> || schnorr sign→verify round-trip, report/receipt canonical payloads, memo grammar, one-shot <code>seenIds</code> dedup
+|-
+| <code>v4call-adapter.test.js</code> || v4call <code>meteredUsage</code> (call-seconds → hours), rate + duration cap, reproduces v4call's <code>processCallEnd</code> numbers
+|-
+| <code>index.test.js</code> || Public surface exports + an end-to-end lifecycle (deposit → close → settle → refund → signed receipt) through the public API only
+|}
+
+'''Green here = the money engine is sound before any real key exists.''' Re-run <code>npm test</code> after every change to escrow-core, and again in the consumer (v4call-node has its own 40 tests — see [[#Step_8:_How_v4call-node_Uses_It_In-Process_(today)|Step 8]]).
+
+== Step 4: Tour the API ==
+
+Everything is reached through <code>require('escrow-core')</code>. The surface groups into six families. (Full signatures in the [[#API_Reference|API Reference]].)
+
+;VERIFY + REPLAY
+: <code>verifyPayment({ txId, sender, account, currency, expectedMemo, expectedAmount })</code> — fetch a transaction by id, confirm the exact amount + exact memo landed in your escrow account, branch on native vs Hive-Engine token. <code>verifySidechain(txId)</code> hard-confirms a Hive-Engine sidechain result.
+;SIGN
+: <code>disburse({ to, amount, currency, memo, fromAccount, keyEnv })</code> — custodial payout from the escrow account. Native HIVE/HBD → a <code>transfer</code> op; Hive-Engine tokens → a <code>custom_json</code>. Throws <code>code:'no_key'</code> if the key env var is unset (so the caller leaves the refund row <code>pending</code> instead of losing it). '''<code>keyEnv</code> is the NAME of the env var''' (e.g. <code>'V4CALL_ESCROW_KEY'</code>) — the secret itself never passes through the API.
+;SETTLE
+: <code>settle({ deposit, meteredUsage, dustFloor, currency, places })</code> → <code>{ settlement, refund, dust }</code> — '''the cap'''. Both numbers rounded to the currency's on-chain precision. <code>registerPrecision(currency, places)</code> teaches the engine a token's decimal count.
+;LEDGER
+: <code>openLedger(dbPath, { adapterMigrations })</code> → a handle with <code>recordPayment</code> (the replay guard), <code>atomicClose</code> (single-winner), <code>recordRefund</code> / <code>markRefundSettled</code>, and idempotent <code>recordConsent</code> / <code>recordReceipt</code>.
+;RELEASE
+: <code>evaluateRelease({ policy, owner, releaser, consented, elapsed })</code> → "may this releaser act, and should the escrow end?". <code>verifyHiveSig(messageBytes, sig, pubKey)</code> verifies a Hive ECDSA signature, '''fail-closed'''.
+;ESCROW-PROTOCOL 0.1
+: The node↔escrow seam (distinct from the Hive release-sig layer). <code>buildEventReport(...)</code> / <code>buildSettlementReceipt(...)</code> build canonical payloads; <code>signReport</code> / <code>verifyReport</code> are '''schnorr''' (Nostr-family) over those payloads; <code>buildMemo</code> / <code>parseMemo</code> own the on-chain memo grammar <code><namespace>:<purpose>:<reservationId></code>; <code>createSeenIds()</code> is the bounded one-shot dedup for nonces.
+
+'''Two signature families, kept deliberately distinct''' — don't mix them:
+* '''Release-consent''' uses Hive ECDSA over <code>sha256(message)</code> (<code>verifyHiveSig</code>).
+* '''escrow-protocol reports''' use schnorr/BIP340 (<code>signReport</code> / <code>verifyReport</code>) — the same key family as v4call's Nostr federation.
+
+== Step 5: Understand the Ledger Schema ==
+
+The durable ledger is plain SQLite. The core migration (<code>migrations/001_escrow_core.sql</code>) creates four tables; an adapter appends its own columns (version ≥ 100). All timestamps are integer unix-ms.
+
+{| class="wikitable"
+|-
+! Table !! Purpose !! Key columns / guards
+|-
+| <code>payments</code> || Confirmed on-chain deposits + the single-winner settle flip || <code>tx_id</code> '''UNIQUE''' (replay guard) · <code>ref</code> · <code>sender</code> · <code>currency</code> · <code>amount</code> (= settlement cap) · <code>memo</code> · <code>status</code> (confirmed/…/refunded) · <code>settle_state</code> (open→closed via <code>atomicClose</code>)
+|-
+| <code>refunds</code> || Durable custodial refund lifecycle || <code>refund_id</code> PK · <code>ref</code> · <code>to_account</code> · <code>amount</code> · <code>status</code> (pending/sent/failed/skipped) · <code>tx_id</code> (the disburse txid once sent)
+|-
+| <code>release_consents</code> || Idempotent per-(ref, releaser) signed consent || PK <code>(ref, releaser)</code> — <code>INSERT OR IGNORE</code> → idempotent · <code>sig</code> kept for audit
+|-
+| <code>receipts</code> || Idempotent per-(ref, recipient) proof-of-receipt || PK <code>(ref, recipient)</code> — idempotent · <code>proof_hash</code> · <code>sig</code>
+|}
+
+The <code>payments</code> table is the '''settlement source of truth''' — settlement reads money facts from the durable row, never from in-memory state. That is exactly the property v4call lacked before the migration and gains by adopting escrow-core.
+
+'''Versioning rule''': core migrations occupy versions 1–99; adapter migrations are version ≥ 100 and '''only <code>ALTER TABLE</code>''' to append columns — they never <code>CREATE</code> core tables.
+
+== Step 6: The Adapter — the Per-Service Seam ==
+
+escrow-core is shared; the few things that genuinely differ per service live in a small '''adapter''', never in <code>if (service === …)</code> branches. The contract (<code>adapter.js</code>, enforced by <code>validateAdapter()</code>):
+
+<pre>
+EscrowAdapter = {
+  account,        // Hive escrow account the payment must go to     (config)
+  currency,       // default/primary token symbol                   (config)
+  keyEnv,         // NAME of the env var holding the active key      (config — never the secret)
+  memoNamespace,  // <namespace> in <namespace>:<purpose>:<id>       (config)
+
+  precision(currency)      → places,        // per-currency decimals, locked at reservation time
+  meteredUsage(record,now) → coins,         // the METERING-UNIT seam
+  releasePolicy(record)    → policyObject,  // the RELEASE-CONDITION seam
+  ledgerSchema()           → migrationSQL,  // per-service columns appended to the core tables
+}
+</pre>
+
+The spike confirmed the two seams exactly: '''metering unit''' (refund math) and '''release condition'''. The <code>v4call</code> adapter (<code>adapters/v4call.js</code>, <code>createV4callAdapter({ account, currency, keyEnv })</code>) fills them in:
+
+* <code>account</code> = <code>process.env.ESCROW_ACCOUNT</code> or <code>v4call-escrow</code>; <code>currency</code> = <code>HBD</code>; <code>keyEnv</code> = <code>V4CALL_ESCROW_KEY</code>; <code>memoNamespace</code> = <code>v4call</code>.
+* <code>meteredUsage(record, now)</code> = '''call-seconds → coins''': <code>ratePerHour × hours</code>, where <code>hours = (now − start) / 3600000</code>, optionally clamped by <code>maxDurationMin</code>. It reads both the in-memory shape (<code>ratePerHour</code>, <code>startTime</code>) and the durable-row shape (<code>rate_per_hour</code>, <code>start_ts</code>), so it works the same before and after the migration.
+* <code>releasePolicy(record)</code> = <code>{ type: 'duration_elapsed' }</code> — v4call releases when the call ends / its duration elapses.
+* <code>ledgerSchema()</code> appends v4call's per-call columns (<code>rate_per_hour</code>, <code>start_ts</code>, <code>connect_paid</code>, <code>ring_paid</code>, <code>platform_fee</code>, <code>callee</code>) at migration version 100.
+
+'''Adding a second service later''' (e.g. when ipfs-gate becomes a live consumer) means writing one more adapter with its own <code>meteredUsage</code> (pin-hours instead of call-seconds) and <code>releasePolicy</code> — and '''zero''' changes to the core.
+
+== Step 7: A Worked Settlement (min(usage, deposit)) ==
+
+This is the cap, by hand. Suppose a caller escrows a '''0.600 HBD''' deposit for up to one hour at '''1.000 HBD/hour'''.
+
+;Case A — they talk for 18 minutes (0.3 h)
+: <code>meteredUsage = 1.000 × 0.3 = 0.300</code>. <code>settle({ deposit: 0.6, meteredUsage: 0.3, currency: 'HBD' })</code> → <code>{ settlement: 0.300, refund: 0.300, dust: 0 }</code>. Callee is paid 0.300 (minus platform fee), caller refunded 0.300.
+;Case B — a buggy/lying report claims 5 hours
+: <code>meteredUsage = 5.000</code>, but <code>settlement = min(5.0, 0.6) = 0.600</code> → <code>{ settlement: 0.600, refund: 0, dust: 0 }</code>. '''The cap holds''': the most that can be paid out is the 0.600 actually escrowed on-chain. No money is minted.
+;Case C — the leftover is below the dust floor
+: If <code>refund < dustFloor</code>, the refund is suppressed (<code>refund: 0</code>, <code>dust:</code> the tiny amount) rather than broadcasting a sub-precision transfer.
+
+All amounts are rounded to the currency's precision (HBD = 3 places; tokens via <code>registerPrecision</code>). This is the behaviour <code>settle.test.js</code> pins against ipfs-gate's numbers, and <code>v4call-adapter.test.js</code> reproduces v4call's own <code>processCallEnd</code> figures.
+
+== Step 8: How v4call-node Uses It In-Process (today) ==
+
+Right now escrow-core is consumed '''in-process''' by v4call-node — it is a dependency, not a separate box. This is the current, working reality and it is what the migration achieved.
+
+;Wiring
+: v4call-node's <code>package.json</code> pins <code>"escrow-core": "file:../escrow-core"</code>. At boot the node calls <code>createV4callAdapter()</code>, opens its own durable ledger (<code>logs/v4call-escrow.db</code> — a separate file from the legacy <code>v4call-ledger.db</code>) via <code>openLedger(path, { adapterMigrations })</code>, and logs:
+: <code>[escrow] escrow-core 0.1.0 ledger ready: .../logs/v4call-escrow.db (@v4call-escrow, HBD)</code>
+;What the migration did (the upgrade, not a refactor)
+: Every paid path (ring/connect/deposit/top-up, paid DM + attachment, local + federated invite, and the federated receive handlers) now: verifies '''tx-anchored''' (<code>verifyPayment</code>, exact-memo + Hive-Engine sidechain hard-confirm) and records a '''replay-guarded''' row (<code>recordPayment</code>, <code>tx_id UNIQUE</code>); settles via <code>atomicClose</code> → <code>adapter.meteredUsage</code> → <code>settle</code> (the cap) → durable <code>recordRefund</code> → <code>disburse</code> → <code>markRefundSettled</code>; and treats the durable row as the settlement source of truth (in-memory <code>activePayments</code> demoted to a live-call cache). The old balance/history scan verifiers are dead.
+;Client contract change
+: Every paid event now '''requires a <code>txId</code>''' (the Keychain transaction id); the matching v4call-app (desktop + mobile) forwards it. There is '''no''' legacy-scan fallback — old clients fail paid actions until updated.
+;The escrow-protocol seam is already in place
+: Settlement is already expressed as a node→escrow signed <code>event-report</code> and an escrow→node signed <code>settlement-receipt</code> (the node's Nostr key, with <code>createSeenIds</code> dedup). In-process, the reporter signs '''and''' verifies with the same key, so settlement is guarded only by the durable ledger (a seam bug can't strand money). On the isolated box, <code>verifyReport</code> / <code>markSeen</code> become hard gates — a one-line change. This is why the box move is a '''transport swap''', not a rewrite.
+;Verify it yourself
+: <code>cd v4call-node && npm test</code> → '''40 passing''' (unit per paid path, replay, crash-mid-settle, the cap, precision). escrow-core's own 67 stay green alongside.
+
+For the operator-facing side of running v4call-node (env, Nginx, SSL, client wiring), see the '''v4call-node''' <code>walkthrough.wiki</code>.
+
+== Step 9: The Isolated Escrow Box (the gated next phase) ==
+
+'''Status: designed, NOT built. Owner-gated.''' Do not improvise this on a production system. It is documented here so the path is clear, but it is the next phase, not a thing you can <code>git clone</code> and run today (escrow-core ships no box entrypoint by design).
+
+The end-state goal (handover §1, §8–§9): escrow-core and the active key move off the node onto their own minimal host, so a compromise of the busy, internet-facing node can't drain the money.
+
+{| class="wikitable"
+|-
+! Aspect !! In-process (today) !! Isolated box (planned)
+|-
+| Where escrow-core runs || Inside the v4call-node process || On its own '''v4call-escrow''' host
+|-
+| Where <code>V4CALL_ESCROW_KEY</code> lives || On the node || '''Only''' on the escrow box; node holds no money key
+|-
+| Host OS || Dev/test on Ubuntu (in a node:20-alpine container) || Minimal '''Alpine''' host, minimal surface
+|-
+| node↔escrow transport || Same-process function calls || Signed <code>escrow-protocol/0.1</code> events over Nostr (via nGate); reuses the existing <code>seenIds</code> replay dedup
+|-
+| Report verification || Reporter signs+verifies with same key (ledger is the guard) || <code>verifyReport</code> / <code>markSeen</code> become '''hard gates'''
+|-
+| Claude / dev tooling on the box || n/a || '''Deliberately none''' — no Claude on the money box
+|}
+
+Design notes carried for whoever builds it:
+* '''Two Nostr keys per node''' — a fed key (presence) and a separate escrow-reporting key (independent rotation), both bound on-chain via the Hive announcement (<code>nostr_pubkey</code>), the same way the existing fed binding gate works.
+* '''Memo grammar is already live''' — <code><namespace>:<purpose>:<reservationId></code> (e.g. <code>v4call:call:call_42</code>) is what the in-process verify already checks, so there's zero migration on the on-chain side when the transport changes.
+* '''Each escrow is its own account/key/DB on its own box''' — a host-level compromise drains '''one''' service, not both. (When ipfs-gate becomes a consumer, it gets <code>ipfs-gate-escrow</code> — box B, account B, key B — never a shared box.)
+
+== Step 10: The TEST-Token Dry-Run (mandatory before prod) ==
+
+'''Status: gated. The single hard gate before any production node points at a real escrow box.''' Whether you are validating the in-process engine on a staging node or a freshly-stood-up isolated box, you must prove the four money behaviours against a '''throwaway TEST token''' (never real HBD) first:
+
+# '''Verify''' — pay the escrow account a known amount with a known memo; confirm <code>verifyPayment</code> accepts it (right account, currency, amount, memo, tx-anchored).
+# '''Refund''' — run a settlement that leaves a remainder; confirm the refund row goes <code>pending → sent</code> and the on-chain refund lands.
+# '''Replay-reject''' — feed the '''same''' transaction id twice; confirm the second is rejected with <code>code:'conflict'</code> and '''no''' second disbursement happens.
+# '''Crash-no-double-disburse''' — kill the process between <code>atomicClose</code> and the disburse, restart, and confirm the retry settles '''exactly once''' (the closed payment + pending refund replays to a single payout, never two).
+
+These four map directly to the invariants in [[#The_Two_Money_Invariants_(Never_Weaken_These)|§2]] and to the existing tests (<code>ledger.test.js</code> replay + <code>index.test.js</code> crash-mid-settle in escrow-core; the <code>escrow-*.test.js</code> suite in v4call-node). '''Do not skip them''', and do not let a production node settle real funds through a box that hasn't passed them.
+
+=== The two adversarial checks — scripted (copy-paste) ===
+
+Checks 1–2 (verify + refund) are the happy path and are confirmed by a normal paid call/DM — the deploy test already exercised those live (a real paid DM and a metered TEST-token call both settled correctly). It's checks '''3 (replay-reject)''' and '''4 (crash-no-double-disburse)''' — the two ''failure-mode'' guards — that a happy-path call never exercises, so the repo ships a harness that runs both for you:
+
+ cd /opt/v4call/escrow-core        # wherever escrow-core is cloned
+ node scripts/dry-run-adversarial.js
+
+'''What it does''' — it drives the '''real''' escrow-core primitives (<code>openLedger</code> / <code>recordPayment</code> / <code>atomicClose</code> / <code>settle</code> / <code>recordRefund</code> / <code>markRefundSettled</code> / <code>disburse</code>) against a '''real on-disk SQLite ledger''', and:
+* replays the same <code>tx_id</code> and confirms the second <code>recordPayment</code> throws <code>code:'conflict'</code> with '''no''' second disbursement;
+* spawns a '''real child process''' that closes the escrow and records the pending refund, then <code>process.exit()</code>s '''before''' the disburse (a genuine mid-settle kill), then '''restarts''' and confirms the pending refund is paid '''exactly once''' — and that re-running recovery, or a duplicate call-end, disburses nothing more.
+
+'''Why it's safe''' — only the on-chain broadcast is mocked (an injected dhive client), so there is '''no key, no funds, and no network'''; a throwaway never-funded key is generated purely so <code>disburse()</code>'s key-parse path runs. It writes only to a throwaway temp dir. '''Exit 0''' = both guards held (expect <code>ALL GUARDS HELD — 13/13 checks passed</code>); non-zero = a guard failed, so '''do not settle real funds''' until you understand why.
+
+'''One honest limitation it prints''' — a residual window (the broadcast '''succeeds''' but the process dies before <code>markRefundSettled</code>) is closed at the '''chain/transport''' layer (the disburse memo + the verify-side <code>createSeenIds</code> dedup), '''not''' by the offline ledger. The harness proves the <code>atomicClose</code>-gated recovery, which is the part the pure ledger guarantees. For the fullest assurance, also do checks 1–2 (verify + refund) live against a throwaway Hive-Engine token on the actual box before pointing a production node at it.
+
+== API Reference ==
+
+Exact signatures (param names) as exported from <code>require('escrow-core')</code>:
+
+<pre>
+// VERIFY + REPLAY
+verifyPayment({ txId, sender, account, currency, expectedMemo, expectedAmount }, deps={})
+                                          → { txId, sender, paid, currency, blockNum, confirmed }
+verifySidechain(txId, { retries=5, delayMs=3000 }={})
+                                          → { confirmed, logs } | { confirmed:false, reason, … }
+getAccountPostingPubkeys(account)         → [ "STM…", … ]
+isNativeCurrency(currency)                → boolean   // HIVE/HBD
+
+// SIGN
+disburse({ to, amount, currency, memo, fromAccount, keyEnv, places }, deps={})
+                                          → { txId, currency } | throws code:'no_key' | 'bad_request'
+buildDisburseOp({ to, amount, currency, memo='', fromAccount, places })  → op tuple (pure; no key/network)
+
+// SETTLE
+settle({ deposit, meteredUsage, dustFloor=0, currency, places, lockedRate })
+                                          → { settlement, refund, dust }   // settlement = min(usage, deposit)
+roundCoins(amount, currency, places)      → number
+precision(currency)                       → places   // HIVE/HBD = 3; default 3
+registerPrecision(currency, places)       → places
+
+// LEDGER — openLedger(dbPath, { now, migrationsDir, adapterMigrations }) → handle:
+recordPayment(payment)        → { id }    // throws code:'conflict' on duplicate tx_id
+getPaymentByTxId(txId) · getPaymentById(id) · getPaymentsByRef(ref)
+markPaymentRefunded(paymentId, refundTxId)
+atomicClose(ref)              → boolean   // true iff THIS call won the single-winner race
+recordRefund({ ref, to_account, amount, currency, memo, status='pending', reason, tx_id }) → { refund_id }
+markRefundSettled(refundId, status, txId=null) · getRefund(refundId)
+recordConsent(ref, releaser, sig=null)    → { inserted }    // idempotent
+getConsents(ref)
+recordReceipt(ref, recipient, proofHash, sig=null) → { inserted }   // idempotent
+getReceipts(ref) · close() · db
+
+// RELEASE
+evaluateRelease({ policy, owner, releaser, consented=[], elapsed })
+                                          → { authorized, ends, records_consent }
+normalizeReleasePolicy(policy)            → { type, addresses }
+verifyHiveSig(messageBytes, sigStr, pubKeyStr)  → boolean   // Hive ECDSA, fail-closed
+sha256Hex(bytes) · sha256Bytes(bytes)
+
+// ESCROW-PROTOCOL 0.1  (PROTO = 'escrow-protocol/0.1')
+buildEventReport({ service, ref, subject, facts, nonce, createdAt, reporter })
+buildSettlementReceipt({ ref, settlement, refund, dust, currency, disburseTx, status, createdAt })
+signReport(payload, skHex)                → { …payload, sig, pubkey }   // schnorr / BIP340
+verifyReport(signed, expectedPubkey)      → boolean   // fail-closed
+getReportingPubkey(skHex)                 → hex
+buildMemo({ namespace, purpose, reservationId })  → "<namespace>:<purpose>:<reservationId>"
+parseMemo(memo)                           → { namespace, purpose, reservationId } | null
+createSeenIds(maxSize=5000)               → { markSeen(id)→bool, has(id), clear(), size }
+
+// ADAPTERS
+validateAdapter(adapter)                  → adapter | throws code:'bad_request' { issues:[…] }
+createV4callAdapter({ account, currency, keyEnv }={})  → EscrowAdapter
+</pre>
+
+;Release-policy types
+: <code>owner_only</code> (default) · <code>any_of { addresses }</code> · <code>all_of { addresses }</code> (consensus) · <code>duration_elapsed</code> (v4call: auto-release when the call ends).
+;Coded errors to handle
+: <code>conflict</code> (replay — duplicate tx_id) · <code>no_key</code> (disburse key env unset — keep the refund row pending) · <code>bad_request</code> (invalid input) · <code>unprocessable_entity</code> (verify mismatch).
+
+== Common Problems and Fixes ==
+
+=== <code>npm install</code> fails on better-sqlite3 (<code>node-gyp</code> / <code>make: not found</code>) ===
+The native build toolchain is missing. Ubuntu: <code>apt install -y build-essential python3</code>. macOS: install Xcode command-line tools. Then re-run <code>npm install</code>.
+
+=== Tests want network or a key ===
+They shouldn't — the suite is hermetic (injected transaction fetcher, <code>:memory:</code> DBs, no env vars). If a test reaches the network you've likely edited a module to call a live node directly instead of through the injectable <code>deps</code>; restore the dependency-injection seam.
+
+=== <code>recordPayment</code> throws <code>code:'conflict'</code> ===
+'''Working as intended.''' That transaction id was already recorded — it's the replay guard firing. The caller should treat the existing row as authoritative, not retry the payment.
+
+=== <code>disburse</code> throws <code>code:'no_key'</code> ===
+The env var named by the adapter's <code>keyEnv</code> (e.g. <code>V4CALL_ESCROW_KEY</code>) isn't set in the process environment. By design the caller catches this and leaves the refund/payout row <code>pending</code> so nothing is lost — set the key and re-run settlement.
+
+=== A consumer's escrow ledger looks empty / wrong file ===
+escrow-core's <code>payments</code> table is its own DB file (e.g. <code>v4call-escrow.db</code>), '''separate''' from any legacy ledger (<code>v4call-ledger.db</code>). Make sure the consumer opened the right path (<code>ESCROW_DB_PATH</code> in v4call-node) and that the adapter migrations ran (version 100 columns present).
+
+=== I want to deploy escrow-core as a server ===
+You can't — and shouldn't try to improvise it. escrow-core is a library; the isolated-box deployment is the gated next phase ([[#Step_9:_The_Isolated_Escrow_Box_(the_gated_next_phase)|Step 9]]) and must pass the TEST-token dry-run ([[#Step_10:_The_TEST-Token_Dry-Run_(mandatory_before_prod)|Step 10]]) before any production node points at it.
+
+== Quick Reference ==
+
+;Install + prove
+: <code>npm install</code> then <code>npm test</code> → expect '''67 passing''', fully offline.
+;Verify the consumer too
+: <code>cd ../v4call-node && npm test</code> → expect '''40 passing'''.
+;The two invariants
+: '''Replay''' — <code>tx_id UNIQUE</code>, <code>recordPayment</code> throws <code>conflict</code>. '''Cap''' — <code>settle = min(usage, deposit)</code>, <code>atomicClose</code> single-winner.
+;The two adapter seams
+: '''metering unit''' (<code>meteredUsage</code> — call-seconds for v4call) and '''release condition''' (<code>releasePolicy</code> — <code>duration_elapsed</code> for v4call). Everything else is shared core.
+;State of play
+: In-process on v4call-node '''today'''; isolated <code>v4call-escrow</code> box + TEST-token dry-run are the '''gated''' next phase. Built '''from''' ipfs-gate v0.1.3; ipfs-gate is the golden reference, not yet a live consumer.
+;Source of truth
+: <code>handover-decoupling.md</code> (§8 verdict + spike result) · <code>handover-escrow-core.md</code> + <code>handover-escrow-core-api-refactor.md</code> · the v4call-node <code>walkthrough.wiki</code> for the operator side.
+
+== Reproduction Notes (deploy test #0, 2026-06-17) ==
+
+Reproduced as part of the <code>node.v4call.com</code> deploy. '''Steps 1–3 verified exactly as written:''' clone, <code>npm install</code> (compiled <code>better-sqlite3 ^11.x</code> against Node 20 with <code>build-essential</code>), and <code>npm test</code> → '''67/67 passing, fully offline''' (no keys, no network). The sibling layout (<code>escrow-core</code> next to <code>v4call-node</code> under <code>/opt/v4call</code>), the <code>file:../escrow-core</code> consumption, the in-process boot line (<code>[escrow] escrow-core 0.1.0 ledger ready … @v4call-escrow, HBD</code>), and the API surface (Step 4 / API Reference) all matched the running module. '''No corrections needed to this file.'''
+
+In production, the in-process engine was exercised live: a real paid DM (HBD) and a full metered voice + video call (TEST token) both settled correctly through the happy path (verify → <code>atomicClose</code> → <code>meteredUsage</code> → <code>settle</code> cap → refund/disburse). The '''adversarial half''' of the Step 10 dry-run — '''replay-reject''' and '''crash-no-double-disburse''' — is now a one-command harness: <code>node scripts/dry-run-adversarial.js</code> (see [[#The_two_adversarial_checks_—_scripted_(copy-paste)|Step 10]]), which drives the real ledger + a real child-process kill with the broadcast mocked (no key/funds/network) and prints <code>ALL GUARDS HELD — 13/13</code>. '''Still mandatory before scaling real funds:''' run that harness on the box, plus checks 1–2 (verify + refund) live against a throwaway token. Full report: <code>decoupling-notes/test1/decoupling-test0.md</code>.
