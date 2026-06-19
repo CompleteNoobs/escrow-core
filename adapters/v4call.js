@@ -14,6 +14,7 @@
 'use strict';
 
 const { precision: corePrecision } = require('../settle');
+const { parseMemo } = require('../escrow-protocol');
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -75,6 +76,116 @@ function createV4callAdapter({ account, currency, keyEnv } = {}) {
     /** Release-condition seam: a v4call call releases when it ends / its duration elapses. */
     releasePolicy(/* record */) {
       return { type: 'duration_elapsed' };
+    },
+
+    /**
+     * Settlement-split seam: v4call's payout/refund/platform-fee division of a settled
+     * call. Reproduces server.js processCallEnd EXACTLY (the money split, lines ~2779-2878):
+     *   calleeGross    = connectPaid + durationCost
+     *   platformOnCall = calleeGross * platformFee
+     *   calleeNet      = calleeGross - platformOnCall          → callee
+     *   refundAmount   = settle().refund                       → caller
+     *   platformTotal  = ringPaid + platformOnCall             → feeAccount
+     * Each amount is rounded to the currency precision and only emitted if ≥ the dust
+     * floor (10^-places), matching the node's `>= floor` guards.
+     *
+     * CONSERVATION (the box's safety property): calleeNet + refundAmount + platformTotal
+     * = ringPaid + connectPaid + depositPaid − dust, for ANY rate/fee/duration. So a
+     * lying event-report can only re-split the verified envelope, never mint or drain —
+     * which is why the box verifies ring/connect/deposit ON-CHAIN and feeds the verified
+     * buckets in here.
+     *
+     * @param facts  { connect_paid|connectPaid, ring_paid|ringPaid, platform_fee|platformFee,
+     *                 callee, caller|sender, currency }   (verified buckets, from the box)
+     * @param settled { settlement (durationCost), refund (refundAmount) }  (from settle())
+     * @param ctx    { ref, feeAccount, durationMin?, places? }
+     * @returns { outflows: [{ kind, to_account, amount, currency, memo, reason }], calleeGross, platformOnCall, calleeNet, platformTotal }
+     */
+    settlementSplit(facts = {}, settled = {}, ctx = {}) {
+      const currency = facts.currency || this.currency;
+      const places = Number.isInteger(ctx.places) ? ctx.places : this.precision(currency);
+      const floor = Math.pow(10, -places);
+      const r = (n) => parseFloat(Number(n || 0).toFixed(places));
+
+      const connectPaid = Number(facts.connect_paid ?? facts.connectPaid ?? 0);
+      const ringPaid    = Number(facts.ring_paid    ?? facts.ringPaid    ?? 0);
+      const platformFee = Number(facts.platform_fee ?? facts.platformFee ?? 0.10);
+      const callee      = facts.callee;
+      const caller      = facts.caller ?? facts.sender;
+
+      const durationCost = Number(settled.settlement ?? 0);
+      const refundAmount = Number(settled.refund ?? 0);
+
+      const calleeGross    = r(connectPaid + durationCost);
+      const platformOnCall = r(calleeGross * platformFee);
+      const calleeNet      = r(calleeGross - platformOnCall);
+      const platformTotal  = r(ringPaid + platformOnCall);
+
+      const ref    = ctx.ref;
+      const durMin = (ctx.durationMin != null) ? Number(ctx.durationMin).toFixed(1) : '0.0';
+
+      const outflows = [];
+      if (callee && calleeNet >= floor) {
+        outflows.push({ kind: 'payout', to_account: callee, amount: calleeNet, currency,
+          memo: `v4call:payout:${ref}:${durMin}min`, reason: 'payout' });
+      }
+      if (caller && refundAmount >= floor) {
+        outflows.push({ kind: 'refund', to_account: caller, amount: refundAmount, currency,
+          memo: `v4call:refund:${ref}:unused-credit`, reason: 'refund' });
+      }
+      if (ctx.feeAccount && platformTotal >= floor) {
+        outflows.push({ kind: 'platform_fee', to_account: ctx.feeAccount, amount: platformTotal, currency,
+          memo: `v4call:fee:${ref}:ring+cut`, reason: 'platform_fee' });
+      }
+      return { outflows, calleeGross, platformOnCall, calleeNet, platformTotal };
+    },
+
+    /**
+     * Build the call-end `event-report` FACTS (the node↔box envelope) from a call's durable
+     * payment rows. This is the contract the keyless node sends to the box and the box settles
+     * against (escrow-box.handleReport reads exactly this shape). Defined here — the shared
+     * lib — so node and box agree by construction. PURE.
+     *
+     * `payments` carries every escrowed tx so the box can RE-VERIFY them on-chain (the safety
+     * envelope); `callFacts` are node-asserted metering knobs that the cap + conservation make
+     * re-split-only. `purpose` is advisory — the box re-derives it from each verified memo.
+     *
+     * @param payRows         escrowLedger.getPaymentsByRef(callId)
+     * @param endReason       why the call ended
+     * @param now             epoch ms (settlement clock)
+     * @param maxDurationMin  the node's MAX_CALL_DURATION_MIN (metering clamp)
+     */
+    buildCallEndReportFacts({ payRows, endReason = 'unknown', now, maxDurationMin } = {}) {
+      const rows = Array.isArray(payRows) ? payRows : [];
+      const primary = rows.find(r => r.rate_per_hour != null) || rows[0] || {};
+      const currency = primary.currency || this.currency;
+      const startTs = (primary.start_ts != null) ? Number(primary.start_ts) : null;
+      const durationMs = (startTs && now) ? Math.max(0, now - startTs) : 0;
+      const callFacts = {
+        ratePerHour: (primary.rate_per_hour != null) ? Number(primary.rate_per_hour) : 0,
+        platformFee: (primary.platform_fee != null) ? Number(primary.platform_fee) : 0.10,
+        callee: primary.callee || null,
+        startTs,
+        maxDurationMin: (maxDurationMin != null) ? Number(maxDurationMin) : undefined,
+      };
+      // Combined-transfer re-split (node-asserted): the live node funds ring+connect+deposit
+      // as ONE on-chain transfer and records it as a SINGLE deposit-purpose row, with the
+      // non-refundable ring/connect portions as COLUMNS (not separate memo-classified
+      // payments). Surface those columns so the box can carve them back out of the verified
+      // deposit envelope. Present ONLY in the combined case; absent when ring/connect were
+      // their own on-chain transfers (the box then classifies them by memo). The box only
+      // ever uses these to RE-SPLIT the on-chain-verified total — never to mint.
+      if (primary.connect_paid != null) callFacts.connectPaid = Number(primary.connect_paid);
+      if (primary.ring_paid    != null) callFacts.ringPaid    = Number(primary.ring_paid);
+      const payments = rows.map(r => ({
+        txId: r.tx_id,
+        sender: r.sender,
+        purpose: (parseMemo(r.memo) || {}).purpose || 'deposit',
+        amount: Number(r.amount),
+        memo: r.memo,
+        currency: r.currency || currency,
+      }));
+      return { kind: 'call-end', endReason, endedAt: now || null, durationMs, currency, callFacts, payments };
     },
 
     /** Per-service ledger columns (the migration SQL appended to the core tables). */
