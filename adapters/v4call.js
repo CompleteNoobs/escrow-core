@@ -188,6 +188,64 @@ function createV4callAdapter({ account, currency, keyEnv } = {}) {
       return { kind: 'call-end', endReason, endedAt: now || null, durationMs, currency, callFacts, payments };
     },
 
+    /**
+     * Build a single-payment event-report FACTS — the non-call settlements (paid DMs,
+     * attachments, invites, ring-fee refunds). One verified on-chain payment splits into
+     * up to two outflows: a payout to `payoutTo` and a platform fee to the box's configured
+     * feeAccount. Set platformFee 0 for a pure refund (the entire verified amount goes back
+     * to payoutTo — typically the original sender). Unlike buildCallEndReportFacts there is
+     * no metering/cap/refund-of-unused-deposit concept here — the full verified amount is
+     * always disbursed, just split by platformFee.
+     *
+     * @param txId/sender/amount/currency/memo  the ONE on-chain deposit the box re-verifies
+     * @param payoutTo     recipient of the net payout (the original sender, for a refund)
+     * @param platformFee  0..1 fraction to the feeAccount; 0 = pure refund, no fee line
+     */
+    buildSinglePaymentReportFacts({ txId, sender, amount, currency, memo, payoutTo, platformFee = 0 } = {}) {
+      const cur = currency || this.currency;
+      return {
+        kind: 'single-payment',
+        currency: cur,
+        payoutTo,
+        platformFee: Number(platformFee) || 0,
+        payments: [{ txId, sender, amount: Number(amount), memo, currency: cur }],
+      };
+    },
+
+    /**
+     * Settlement-split for a single-payment report (the box calls this with the amount it
+     * independently verified on-chain — never the node's claimed amount). gross splits into
+     * fee (gross * platformFee, → feeAccount) and net (the remainder, → payoutTo). platformFee
+     * 0 collapses this to a pure refund: the entire verified amount goes to payoutTo.
+     *
+     * @param verifiedAmount  the box's own on-chain-verified total (the authority)
+     * @param facts           { currency, payoutTo, platformFee }  (from buildSinglePaymentReportFacts)
+     * @param ctx             { ref, feeAccount, places? }
+     * @returns { outflows: [{ kind, to_account, amount, currency, memo, reason }], gross, fee, net }
+     */
+    singlePaymentSplit(verifiedAmount, facts = {}, ctx = {}) {
+      const currency = facts.currency || this.currency;
+      const places = Number.isInteger(ctx.places) ? ctx.places : this.precision(currency);
+      const floor = Math.pow(10, -places);
+      const r = (n) => parseFloat(Number(n || 0).toFixed(places));
+
+      const platformFee = Number(facts.platformFee) || 0;
+      const gross = r(verifiedAmount);
+      const fee   = r(gross * platformFee);
+      const net   = r(gross - fee);
+
+      const outflows = [];
+      if (facts.payoutTo && net >= floor) {
+        outflows.push({ kind: 'payout', to_account: facts.payoutTo, amount: net, currency,
+          memo: `v4call:payout:${ctx.ref}`, reason: 'payout' });
+      }
+      if (ctx.feeAccount && fee >= floor) {
+        outflows.push({ kind: 'platform_fee', to_account: ctx.feeAccount, amount: fee, currency,
+          memo: `v4call:fee:${ctx.ref}`, reason: 'platform_fee' });
+      }
+      return { outflows, gross, fee, net };
+    },
+
     /** Per-service ledger columns (the migration SQL appended to the core tables). */
     ledgerSchema() {
       return LEDGER_SCHEMA;

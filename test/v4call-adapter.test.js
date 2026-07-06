@@ -196,6 +196,58 @@ test('buildCallEndReportFacts surfaces combined-transfer ring/connect columns in
   assert.equal(facts.callFacts.ringPaid, 0.01);
 });
 
+// ── Single-payment settlement (DMs/attachments/invites/ring-fee refunds) ─────
+test('buildSinglePaymentReportFacts builds the box envelope for a one-shot payment', () => {
+  const facts = adapter.buildSinglePaymentReportFacts({
+    txId: 't_dm', sender: 'cnoobz', amount: 3, currency: 'TEST', memo: 'v4call:text:msg_1',
+    payoutTo: 'completenoober', platformFee: 0.10,
+  });
+  assert.equal(facts.kind, 'single-payment');
+  assert.equal(facts.currency, 'TEST');
+  assert.equal(facts.payoutTo, 'completenoober');
+  assert.equal(facts.platformFee, 0.10);
+  assert.equal(facts.payments.length, 1);
+  assert.equal(facts.payments[0].txId, 't_dm');
+  assert.equal(facts.payments[0].sender, 'cnoobz');
+  assert.equal(facts.payments[0].amount, 3);
+});
+
+test('singlePaymentSplit reproduces the dm-attachment net/fee numbers', () => {
+  const { outflows, gross, fee, net } = adapter.singlePaymentSplit(
+    3, { currency: 'TEST', payoutTo: 'completenoober', platformFee: 0.10 },
+    { ref: 'msg_1', feeAccount: 'v4call' }
+  );
+  assert.equal(gross, 3);
+  assert.equal(fee, 0.3);
+  assert.equal(net, 2.7);
+  const byKind = Object.fromEntries(outflows.map(o => [o.kind, o]));
+  assert.equal(byKind.payout.to_account, 'completenoober');
+  assert.equal(byKind.payout.amount, 2.7);
+  assert.equal(byKind.platform_fee.to_account, 'v4call');
+  assert.equal(byKind.platform_fee.amount, 0.3);
+});
+
+test('singlePaymentSplit with platformFee 0 is a pure refund — entire amount to payoutTo, no fee line', () => {
+  const { outflows, net, fee } = adapter.singlePaymentSplit(
+    0.5, { currency: 'HBD', payoutTo: 'caller', platformFee: 0 },
+    { ref: 'ring_1', feeAccount: 'v4call' }
+  );
+  assert.equal(net, 0.5);
+  assert.equal(fee, 0);
+  assert.equal(outflows.length, 1);
+  assert.equal(outflows[0].kind, 'payout');
+  assert.equal(outflows[0].to_account, 'caller');
+  assert.equal(outflows[0].amount, 0.5);
+});
+
+test('singlePaymentSplit drops sub-floor outflows and a missing feeAccount', () => {
+  const { outflows } = adapter.singlePaymentSplit(
+    0.0001, { currency: 'HBD', payoutTo: 'callee', platformFee: 0.10 },
+    { ref: 'r' }   // no feeAccount, and amount rounds to 0 at 3dp
+  );
+  assert.equal(outflows.length, 0);
+});
+
 // ── Release ──────────────────────────────────────────────────────────────────
 test('releasePolicy is duration_elapsed; evaluateRelease honours the elapsed signal', () => {
   const policy = adapter.releasePolicy({});
