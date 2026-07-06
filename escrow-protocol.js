@@ -71,7 +71,7 @@ function buildEventReport({ service, ref, subject, facts, nonce, createdAt, repo
 }
 
 /** escrow → node: a signed settlement outcome for one escrow `ref`. */
-function buildSettlementReceipt({ ref, settlement, refund, dust, currency, disburseTx, status, createdAt }) {
+function buildSettlementReceipt({ ref, settlement, refund, dust, currency, disburseTx, status, reason, createdAt }) {
   if (!ref || !currency || !status) {
     throw Object.assign(new Error('buildSettlementReceipt: ref, currency, status are required'), { code: 'bad_request' });
   }
@@ -88,6 +88,7 @@ function buildSettlementReceipt({ ref, settlement, refund, dust, currency, disbu
     currency,
     disburse_tx: disburseTx ?? null,  // txId | null (pending/skipped/failed)
     status,
+    reason: reason ?? null,           // human-readable detail for status:'failed' terminal receipts
     created_at: createdAt ?? null,
   };
 }
