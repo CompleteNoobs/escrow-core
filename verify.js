@@ -285,6 +285,63 @@ async function getHiveEngineBalance(account, symbol) {
 }
 
 /**
+ * Idempotency probe for retryable disburse: has `account` ALREADY sent an outgoing
+ * transfer carrying EXACTLY `memo` (in `currency`)? Used before re-broadcasting a
+ * refund whose first attempt threw a transient/network error — so a broadcast that
+ * actually landed but whose response was lost can NEVER be double-paid. Disburse
+ * memos are unique per outflow (v4call:payout:<ref>:…, v4call:offer-refund:<ref>, …),
+ * so an exact-memo match is a reliable "already sent".
+ *
+ * Returns { status:'found', txId } | { status:'not_found' } | { status:'error' }.
+ * status:'error' (the on-chain read itself failed) means UNKNOWN — the caller MUST
+ * NOT re-broadcast this cycle; retry the probe next tick.
+ *
+ * @param deps.hivePostFn / deps.fetchHE   injectable for tests
+ */
+async function findOutgoingByMemo(account, memo, currency, deps = {}) {
+  const acct = String(account || '').toLowerCase();
+  const cur  = String(currency || '').toUpperCase();
+  const wantMemo = String(memo || '');
+  if (!wantMemo) return { status: 'not_found' };   // no memo → can't dedup by memo
+
+  try {
+    if (cur === 'HIVE' || cur === 'HBD') {
+      const post = deps.hivePostFn || hivePost;
+      // Last 500 account-history ops; scan for a matching outgoing native transfer.
+      const hist = await post('condenser_api.get_account_history', [acct, -1, 500]);
+      if (!Array.isArray(hist)) return { status: 'error' };
+      for (const entry of hist) {
+        const rec = entry && entry[1];
+        const op  = rec && rec.op;
+        if (!op || op[0] !== 'transfer') continue;
+        const d = op[1] || {};
+        if (String(d.from).toLowerCase() === acct && d.memo === wantMemo &&
+            typeof d.amount === 'string' && d.amount.endsWith(' ' + cur)) {
+          return { status: 'found', txId: rec.trx_id || null };
+        }
+      }
+      return { status: 'not_found' };
+    }
+    // Hive-Engine token: scan this account's recent transfer history for the memo.
+    const fetchHE = deps.fetchHE || ((url) => fetch(url, { signal: AbortSignal.timeout(10000) }));
+    const url = `https://history.hive-engine.com/accountHistory?account=${encodeURIComponent(acct)}&symbol=${encodeURIComponent(cur)}&limit=100&offset=0`;
+    const res = await fetchHE(url);
+    if (!res || !res.ok) return { status: 'error' };
+    const arr = await res.json();
+    if (!Array.isArray(arr)) return { status: 'error' };
+    for (const t of arr) {
+      if (String(t.from).toLowerCase() === acct && t.memo === wantMemo && String(t.symbol).toUpperCase() === cur) {
+        return { status: 'found', txId: t.transactionId || t.txid || null };
+      }
+    }
+    return { status: 'not_found' };
+  } catch (e) {
+    console.warn(`[verify] findOutgoingByMemo(${acct},${cur}) probe failed: ${e.message}`);
+    return { status: 'error' };
+  }
+}
+
+/**
  * An account's current POSTING public keys (STM-prefixed) — the identity control
  * for signed user endpoints that carry no on-chain payment to anchor identity.
  * Returns [] if the account doesn't exist; throws (network) only if all nodes fail.
@@ -311,6 +368,7 @@ module.exports = {
   verifySidechain,
   getHiveEngineBalance,
   getAccountPostingPubkeys,
+  findOutgoingByMemo,
   isNativeCurrency,
   HIVE_NODE_FALLBACK,
 };

@@ -29,10 +29,12 @@ module.exports = {
   verifyPayment: verify.verifyPayment,
   verifySidechain: verify.verifySidechain,
   getAccountPostingPubkeys: verify.getAccountPostingPubkeys,
+  findOutgoingByMemo: verify.findOutgoingByMemo,
   isNativeCurrency: verify.isNativeCurrency,
 
   // ── SIGN (custodial disburse) ──
   disburse: sign.disburse,
+  classifyBroadcastError: sign.classifyBroadcastError,
 
   // ── SETTLE (the money-safety cap + per-currency precision, Decision #3) ──
   settle: settle.settle,

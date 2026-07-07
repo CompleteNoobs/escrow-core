@@ -10,7 +10,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { disburse, buildDisburseOp } = require('../sign');
+const { disburse, buildDisburseOp, classifyBroadcastError } = require('../sign');
 const { registerPrecision } = require('../settle');
 
 const FROM = 'escrow-acct';
@@ -86,4 +86,34 @@ test('disburse validates inputs before broadcasting (bad dest, key set)', async 
   } finally {
     delete process.env[KEY_ENV];
   }
+});
+
+// ── Transient vs permanent broadcast classification (retry safety) ──────────
+test('classifyBroadcastError: network signatures → transient; on-chain rejections → permanent', () => {
+  for (const m of ['Invalid response body while trying to fetch https://api.hive.blog/: Premature close',
+                   'connect ETIMEDOUT 91.121.216.162:443', 'fetch failed', 'The operation was aborted due to timeout',
+                   'socket hang up', 'HTTP 503 from node', 'ECONNRESET']) {
+    assert.equal(classifyBroadcastError(new Error(m)), 'transient', m);
+  }
+  for (const m of ['missing required active authority', 'Account does not have enough tokens to transfer',
+                   'insufficient resource credits (RC)', 'invalid signature', 'transaction expired (tapos)',
+                   'duplicate transaction']) {
+    assert.equal(classifyBroadcastError(new Error(m)), 'permanent', m);
+  }
+  // unknown shapes fail closed to permanent (never blind-retry-broadcast the unknown)
+  assert.equal(classifyBroadcastError(new Error('something weird happened')), 'permanent');
+  assert.equal(classifyBroadcastError(Object.assign(new Error('x'), { code: 'no_key' })), 'permanent');
+});
+
+test('disburse maps a TRANSIENT broadcast error to code:transient (retryable), keeps permanent as-is', async () => {
+  const KEY_ENV = 'ESCROW_CORE_TEST_XIENT_KEY';
+  process.env[KEY_ENV] = require('@hiveio/dhive').PrivateKey.fromSeed('sign-transient-test').toString();
+  const base = { to: 'alice', amount: 1, currency: 'HBD', memo: 'v4call:payout:r1', fromAccount: FROM, keyEnv: KEY_ENV };
+  try {
+    const transientClient = { broadcast: { sendOperations: async () => { throw new Error('api.hive.blog: Premature close'); } } };
+    await assert.rejects(() => disburse(base, { client: transientClient }), e => e.code === 'transient');
+
+    const permanentClient = { broadcast: { sendOperations: async () => { throw new Error('Account does not have enough tokens'); } } };
+    await assert.rejects(() => disburse(base, { client: permanentClient }), e => e.code !== 'transient' && /enough tokens/.test(e.message));
+  } finally { delete process.env[KEY_ENV]; }
 });

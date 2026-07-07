@@ -73,14 +73,34 @@ function buildDisburseOp({ to, amount, currency, memo = '', fromAccount, places 
   }];
 }
 
+// A broadcast error is TRANSIENT (network / node hiccup — the tx may or may not have
+// landed) vs PERMANENT (bad signature, insufficient balance, RC, malformed op — it
+// definitively did NOT land). Only transients are retryable; the caller leaves the
+// refund 'pending' and retries AFTER an idempotency probe (findOutgoingByMemo) so a
+// landed-but-lost-response tx is never double-paid. Permanent errors bubble up as-is
+// so the caller marks 'failed' and stops. Default-permanent for unknown shapes would
+// strand real transient failures; we default-transient ONLY for recognised network
+// signatures and treat anything with a clear on-chain rejection reason as permanent.
+const PERMANENT_BROADCAST = /missing required|insufficient|does not have|not enough|rc[_ ]|resource credits|invalid signature|signature|tapos|expired|does not exist|unknown key|authority|duplicate|already|bad_request/i;
+const TRANSIENT_BROADCAST = /premature close|timeout|timed ?out|etimedout|econnreset|econnrefused|enotfound|eai_again|socket|fetch failed|network|aborted|und_err|502|503|504|bad gateway|gateway timeout|service unavailable|invalid response body|too many requests|429/i;
+
+function classifyBroadcastError(e) {
+  const msg = String((e && e.message) || '');
+  if (e && (e.code === 'no_key' || e.code === 'bad_request')) return 'permanent';
+  if (PERMANENT_BROADCAST.test(msg)) return 'permanent';
+  if (TRANSIENT_BROADCAST.test(msg)) return 'transient';
+  return 'permanent';   // unknown → fail closed (don't retry-broadcast something we don't understand)
+}
+
 /**
  * Disburse `amount` of `currency` from `fromAccount`'s escrow to `to`, signed with
  * the active key in process.env[keyEnv]. Returns { txId, currency }.
  *
  * Key-optional: if process.env[keyEnv] is unset/empty this throws code:'no_key'
  * (the caller records the refund 'pending' for manual settlement). Input errors
- * throw code:'bad_request'. Network/broadcast failures throw normally (caller marks
- * the refund 'failed' and retries).
+ * throw code:'bad_request'. A TRANSIENT network/broadcast failure throws
+ * code:'transient' (the caller leaves the refund pending and retries after an
+ * idempotency probe). A PERMANENT failure throws as-is (caller marks 'failed').
  *
  * @param deps.client  injectable dhive client (tests); default getDhiveClient()
  */
@@ -99,8 +119,15 @@ async function disburse({ to, amount, currency, memo, fromAccount, keyEnv, place
   const op = buildDisburseOp({ to, amount, currency, memo, fromAccount, places });   // validates inputs
   const key = dhive.PrivateKey.fromString(keyStr);
   const client = deps.client || getDhiveClient();
-  const res = await client.broadcast.sendOperations([op], key);
-  return { txId: res.id, currency: String(currency).toUpperCase() };
+  try {
+    const res = await client.broadcast.sendOperations([op], key);
+    return { txId: res.id, currency: String(currency).toUpperCase() };
+  } catch (e) {
+    if (classifyBroadcastError(e) === 'transient') {
+      throw Object.assign(new Error(`disburse transient broadcast failure: ${e.message}`), { code: 'transient', cause: e });
+    }
+    throw e;
+  }
 }
 
-module.exports = { disburse, buildDisburseOp };
+module.exports = { disburse, buildDisburseOp, classifyBroadcastError };
