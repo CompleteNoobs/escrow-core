@@ -108,20 +108,20 @@ test('settlementSplit reproduces processCallEnd payout/refund/fee numbers', () =
     settled,
     { ref: 'call_1', feeAccount: 'platform', durationMin: 30, places: prec }
   );
-  assert.equal(calleeGross, 1.05);                              // connect + durationCost
-  assert.equal(platformOnCall, 0.105);                         // calleeGross * fee
-  assert.equal(calleeNet, 0.945);                              // calleeGross - platformOnCall
-  assert.equal(platformTotal, 0.115);                          // ring + platformOnCall
+  assert.equal(calleeGross, 1.06);                              // ring + connect + durationCost
+  assert.equal(platformOnCall, 0.106);                         // calleeGross * fee
+  assert.equal(calleeNet, 0.954);                              // calleeGross - platformOnCall
+  assert.equal(platformTotal, 0.106);                          // == platformOnCall (ring is the callee's)
   const byKind = Object.fromEntries(outflows.map(o => [o.kind, o]));
   assert.equal(byKind.payout.to_account, 'callee');
-  assert.equal(byKind.payout.amount, 0.945);
+  assert.equal(byKind.payout.amount, 0.954);
   assert.equal(byKind.payout.memo, 'v4call:payout:call_1:30.0min');
   assert.equal(byKind.refund.to_account, 'caller');
   assert.equal(byKind.refund.amount, 1.0);
   assert.equal(byKind.refund.memo, 'v4call:refund:call_1:unused-credit');
   assert.equal(byKind.platform_fee.to_account, 'platform');
-  assert.equal(byKind.platform_fee.amount, 0.115);
-  assert.equal(byKind.platform_fee.memo, 'v4call:fee:call_1:ring+cut');
+  assert.equal(byKind.platform_fee.amount, 0.106);
+  assert.equal(byKind.platform_fee.memo, 'v4call:fee:call_1:cut');
 });
 
 test('settlementSplit CONSERVES the envelope: payout + refund + fee == ring + connect + deposit − dust', () => {

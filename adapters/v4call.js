@@ -80,12 +80,14 @@ function createV4callAdapter({ account, currency, keyEnv } = {}) {
 
     /**
      * Settlement-split seam: v4call's payout/refund/platform-fee division of a settled
-     * call. Reproduces server.js processCallEnd EXACTLY (the money split, lines ~2779-2878):
-     *   calleeGross    = connectPaid + durationCost
+     * call. Ring-fee model (OWNER decision 2026-07-07): the ring fee belongs to the
+     * CALLEE (their anti-spam fee — they set it, they keep it); the platform takes its
+     * % of the whole callee gross (ring + connect + duration):
+     *   calleeGross    = ringPaid + connectPaid + durationCost
      *   platformOnCall = calleeGross * platformFee
      *   calleeNet      = calleeGross - platformOnCall          → callee
      *   refundAmount   = settle().refund                       → caller
-     *   platformTotal  = ringPaid + platformOnCall             → feeAccount
+     *   platformTotal  = platformOnCall                        → feeAccount
      * Each amount is rounded to the currency precision and only emitted if ≥ the dust
      * floor (10^-places), matching the node's `>= floor` guards.
      *
@@ -116,10 +118,10 @@ function createV4callAdapter({ account, currency, keyEnv } = {}) {
       const durationCost = Number(settled.settlement ?? 0);
       const refundAmount = Number(settled.refund ?? 0);
 
-      const calleeGross    = r(connectPaid + durationCost);
+      const calleeGross    = r(ringPaid + connectPaid + durationCost);
       const platformOnCall = r(calleeGross * platformFee);
       const calleeNet      = r(calleeGross - platformOnCall);
-      const platformTotal  = r(ringPaid + platformOnCall);
+      const platformTotal  = platformOnCall;
 
       const ref    = ctx.ref;
       const durMin = (ctx.durationMin != null) ? Number(ctx.durationMin).toFixed(1) : '0.0';
@@ -135,7 +137,7 @@ function createV4callAdapter({ account, currency, keyEnv } = {}) {
       }
       if (ctx.feeAccount && platformTotal >= floor) {
         outflows.push({ kind: 'platform_fee', to_account: ctx.feeAccount, amount: platformTotal, currency,
-          memo: `v4call:fee:${ref}:ring+cut`, reason: 'platform_fee' });
+          memo: `v4call:fee:${ref}:cut`, reason: 'platform_fee' });
       }
       return { outflows, calleeGross, platformOnCall, calleeNet, platformTotal };
     },
