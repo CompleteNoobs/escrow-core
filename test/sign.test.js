@@ -117,3 +117,50 @@ test('disburse maps a TRANSIENT broadcast error to code:transient (retryable), k
     await assert.rejects(() => disburse(base, { client: permanentClient }), e => e.code !== 'transient' && /enough tokens/.test(e.message));
   } finally { delete process.env[KEY_ENV]; }
 });
+
+// ── nativeBroadcast (native-fetch broadcast path — bypasses dhive's broken node-fetch) ──
+test('disburse via nativeBroadcast: signs offline, broadcasts through the injected rpc, returns the derived txId', async () => {
+  const KEY_ENV = 'ESCROW_CORE_TEST_NB_KEY';
+  process.env[KEY_ENV] = require('@hiveio/dhive').PrivateKey.fromSeed('native-broadcast-test').toString();
+  const calls = [];
+  const rpc = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'condenser_api.get_dynamic_global_properties') {
+      return { head_block_number: 107910716, head_block_id: '066e69bc1f2b5e3f0000000000000000000000ff' };
+    }
+    if (method === 'condenser_api.broadcast_transaction_synchronous') {
+      const tx = params[0];
+      // the signed tx carries our op + a signature
+      if (tx.operations[0][0] !== 'transfer') throw new Error('unexpected op');
+      if (!tx.signatures || tx.signatures.length !== 1) throw new Error('unsigned');
+      return { block_num: 107910717 };
+    }
+    throw new Error('unexpected method ' + method);
+  };
+  try {
+    const { txId } = await disburse(
+      { to: 'alice', amount: 1, currency: 'HBD', memo: 'v4call:payout:nb1', fromAccount: FROM, keyEnv: KEY_ENV },
+      { rpc });
+    assert.match(txId, /^[0-9a-f]{40}$/, 'txId derived from the signed tx');
+    assert.deepEqual(calls.map(c => c.method),
+      ['condenser_api.get_dynamic_global_properties', 'condenser_api.broadcast_transaction_synchronous']);
+  } finally { delete process.env[KEY_ENV]; }
+});
+
+test('nativeBroadcast treats a cross-node DUPLICATE-transaction answer as success (same signed tx = same id)', async () => {
+  const KEY_ENV = 'ESCROW_CORE_TEST_NB_DUP';
+  process.env[KEY_ENV] = require('@hiveio/dhive').PrivateKey.fromSeed('native-broadcast-dup').toString();
+  const rpc = async (method) => {
+    if (method === 'condenser_api.get_dynamic_global_properties') {
+      return { head_block_number: 107910716, head_block_id: '066e69bc1f2b5e3f0000000000000000000000ff' };
+    }
+    // node A accepted the tx but the response was lost; node B answers duplicate
+    throw new Error('JSON-RPC: duplicate transaction check');
+  };
+  try {
+    const { txId } = await disburse(
+      { to: 'alice', amount: 1, currency: 'HBD', memo: 'v4call:payout:nb2', fromAccount: FROM, keyEnv: KEY_ENV },
+      { rpc });
+    assert.match(txId, /^[0-9a-f]{40}$/, 'duplicate answer resolves to success with the derived txId');
+  } finally { delete process.env[KEY_ENV]; }
+});

@@ -18,19 +18,47 @@
 
 const dhive = require('@hiveio/dhive');
 const { precision } = require('./settle');
-const { HIVE_NODE_FALLBACK } = require('./verify');
+const { hivePost } = require('./verify');
 
 const VALID_ACCOUNT = /^[a-z0-9][a-z0-9.\-]*$/;
 
-function getHiveNodes() {
-  const override = (process.env.HIVE_API || '').trim();
-  return override ? [override, ...HIVE_NODE_FALLBACK] : HIVE_NODE_FALLBACK;
-}
-
-let _client = null;
-function getDhiveClient() {
-  if (!_client) _client = new dhive.Client(getHiveNodes(), { timeout: 10000 });
-  return _client;
+/**
+ * Broadcast `ops` signed with `key`, using NATIVE fetch (verify.js hivePost — the
+ * multi-node JSON-RPC helper this library already trusts for verification) instead of
+ * dhive's Client network layer. Why: dhive bundles cross-fetch/node-fetch, which on
+ * the production escrow box (Alpine, Node 24) failed ~100% of requests with
+ * 'Premature close' while native fetch and core https from the SAME box were clean
+ * (diagnosed live 2026-07-07). dhive is still used for what it's good at — OFFLINE
+ * transaction signing (cryptoUtils.signTransaction) — so the wire format is identical.
+ *
+ * Same-shape result as client.broadcast.sendOperations: { id }.
+ * @param deps.rpc  injectable JSON-RPC poster (tests); default verify.hivePost
+ */
+async function nativeBroadcast(ops, key, deps = {}) {
+  const rpc = deps.rpc || hivePost;
+  const dgp = await rpc('condenser_api.get_dynamic_global_properties', []);
+  const headBlockId = Buffer.from(dgp.head_block_id, 'hex');
+  const tx = {
+    ref_block_num: dgp.head_block_number & 0xffff,
+    ref_block_prefix: headBlockId.readUInt32LE(4),
+    expiration: new Date(Date.now() + 60 * 1000).toISOString().slice(0, -5),
+    operations: ops,
+    extensions: [],
+  };
+  const signed = dhive.cryptoUtils.signTransaction(tx, [key]);
+  const id = dhive.cryptoUtils.generateTrxId(signed);
+  // Synchronous broadcast: the node answers only after the tx is accepted into a block
+  // (or rejects). A tx-level rejection comes back as a JSON-RPC error → hivePost throws.
+  try {
+    await rpc('condenser_api.broadcast_transaction_synchronous', [signed]);
+  } catch (e) {
+    // hivePost retries the SAME signed tx across nodes. If node A accepted it but the
+    // response was lost, node B answers 'duplicate transaction' — that IS success
+    // (identical signed tx ⇒ identical tx id, already known to the chain).
+    if (/duplicate transaction/i.test(String(e.message))) return { id };
+    throw e;
+  }
+  return { id };
 }
 
 /**
@@ -102,7 +130,13 @@ function classifyBroadcastError(e) {
  * code:'transient' (the caller leaves the refund pending and retries after an
  * idempotency probe). A PERMANENT failure throws as-is (caller marks 'failed').
  *
- * @param deps.client  injectable dhive client (tests); default getDhiveClient()
+ * Broadcast path: nativeBroadcast (native fetch + offline dhive signing) by default —
+ * dhive's own network layer (cross-fetch/node-fetch) is broken on some hosts (see
+ * nativeBroadcast docblock). Injecting deps.client (tests / explicit override) routes
+ * through client.broadcast.sendOperations instead, unchanged.
+ *
+ * @param deps.client  injectable dhive client (tests); default = nativeBroadcast
+ * @param deps.rpc     injectable JSON-RPC poster for nativeBroadcast (tests)
  */
 async function disburse({ to, amount, currency, memo, fromAccount, keyEnv, places }, deps = {}) {
   if (!keyEnv) {
@@ -118,9 +152,10 @@ async function disburse({ to, amount, currency, memo, fromAccount, keyEnv, place
 
   const op = buildDisburseOp({ to, amount, currency, memo, fromAccount, places });   // validates inputs
   const key = dhive.PrivateKey.fromString(keyStr);
-  const client = deps.client || getDhiveClient();
   try {
-    const res = await client.broadcast.sendOperations([op], key);
+    const res = deps.client
+      ? await deps.client.broadcast.sendOperations([op], key)
+      : await nativeBroadcast([op], key, deps);
     return { txId: res.id, currency: String(currency).toUpperCase() };
   } catch (e) {
     if (classifyBroadcastError(e) === 'transient') {
@@ -130,4 +165,4 @@ async function disburse({ to, amount, currency, memo, fromAccount, keyEnv, place
   }
 }
 
-module.exports = { disburse, buildDisburseOp, classifyBroadcastError };
+module.exports = { disburse, buildDisburseOp, classifyBroadcastError, nativeBroadcast };
