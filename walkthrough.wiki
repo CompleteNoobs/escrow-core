@@ -15,7 +15,7 @@ This guide walks through '''escrow-core''' — the shared custodial-escrow '''li
 
 '''Source of truth''': <code>handover-decoupling.md</code> (§8 the data verdict, the spike result) and <code>handover-escrow-core.md</code> (the focused build brief) in the project root.
 
-'''End result''': escrow-core installed, its '''80 tests passing offline''', the API understood, and a clear picture of both consumption modes: v4call-node in-process (<code>ESCROW_MODE=in-process</code>) and the isolated <code>v4call-escrow</code> box (<code>ESCROW_MODE=box</code> — the production setup: keyless node, box as settlement authority).
+'''End result''': escrow-core installed, its '''89 tests passing offline''', the API understood, and a clear picture of both consumption modes: v4call-node in-process (<code>ESCROW_MODE=in-process</code>) and the isolated <code>v4call-escrow</code> box (<code>ESCROW_MODE=box</code> — the production setup: keyless node, box as settlement authority).
 
 == Contents ==
 
@@ -131,7 +131,7 @@ This is the single most important step. escrow-core's tests are written with '''
 
  npm test
 
-Under the hood this runs <code>node --test test/</code>. Expect '''80 passing''' assertions across 8 files:
+Under the hood this runs <code>node --test test/</code>. Expect '''89 passing''' assertions across 9 files:
 
 {| class="wikitable"
 |-
@@ -149,12 +149,14 @@ Under the hood this runs <code>node --test test/</code>. Expect '''80 passing'''
 |-
 | <code>escrow-protocol.test.js</code> || schnorr sign→verify round-trip, report/receipt canonical payloads, memo grammar, one-shot <code>seenIds</code> dedup
 |-
-| <code>v4call-adapter.test.js</code> || v4call <code>meteredUsage</code> (call-seconds → hours), rate + duration cap, reproduces v4call's <code>processCallEnd</code> numbers
+| <code>v4call-adapter.test.js</code> || v4call <code>meteredUsage</code> (call-seconds → hours), rate + duration cap, the settlement split (ring-fee model: ring in the callee gross, platform = % of gross)
+|-
+| <code>attestation.test.js</code> || Step-6 call attestations: canonical payload, posting-key sign→verify, identity/callId/duration-tolerance checks, shadow verdicts
 |-
 | <code>index.test.js</code> || Public surface exports + an end-to-end lifecycle (deposit → close → settle → refund → signed receipt) through the public API only
 |}
 
-'''Green here = the money engine is sound before any real key exists.''' Re-run <code>npm test</code> after every change to escrow-core, and again in the consumer (v4call-node has its own 40 tests — see [[#Step_8:_How_v4call-node_Uses_It_In-Process_(today)|Step 8]]).
+'''Green here = the money engine is sound before any real key exists.''' Re-run <code>npm test</code> after every change to escrow-core, and again in the consumer (v4call-node has its own 55 tests — see [[#Step_8:_How_v4call-node_Uses_It_In-Process_(today)|Step 8]]).
 
 == Step 4: Tour the API ==
 
@@ -252,7 +254,7 @@ Right now escrow-core is consumed '''in-process''' by v4call-node — it is a de
 ;The escrow-protocol seam is already in place
 : Settlement is already expressed as a node→escrow signed <code>event-report</code> and an escrow→node signed <code>settlement-receipt</code> (the node's Nostr key, with <code>createSeenIds</code> dedup). In-process, the reporter signs '''and''' verifies with the same key, so settlement is guarded only by the durable ledger (a seam bug can't strand money). On the isolated box, <code>verifyReport</code> / <code>markSeen</code> become hard gates — a one-line change. This is why the box move is a '''transport swap''', not a rewrite.
 ;Verify it yourself
-: <code>cd v4call-node && npm test</code> → '''55 passing''' (unit per paid path, replay, crash-mid-settle, the cap, precision, box-mode loopbacks). escrow-core's own 80 stay green alongside.
+: <code>cd v4call-node && npm test</code> → '''55 passing''' (unit per paid path, replay, crash-mid-settle, the cap, precision, box-mode loopbacks). escrow-core's own 89 stay green alongside.
 
 For the operator-facing side of running v4call-node (env, Nginx, SSL, client wiring), see the '''v4call-node''' <code>walkthrough.wiki</code>.
 
@@ -397,7 +399,7 @@ You can't — and shouldn't try to improvise it. escrow-core is a library; the i
 == Quick Reference ==
 
 ;Install + prove
-: <code>npm install</code> then <code>npm test</code> → expect '''80 passing''', fully offline.
+: <code>npm install</code> then <code>npm test</code> → expect '''89 passing''', fully offline.
 ;Verify the consumer too
 : <code>cd ../v4call-node && npm test</code> → expect '''55 passing'''.
 ;The two invariants
