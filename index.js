@@ -16,6 +16,7 @@ const settle = require('./settle');
 const ledger = require('./ledger');
 const release = require('./release');
 const protocol = require('./escrow-protocol');
+const attestation = require('./attestation');
 const adapter = require('./adapter');
 const { createV4callAdapter } = require('./adapters/v4call');
 
@@ -24,6 +25,11 @@ try { version = require('./package.json').version; } catch { /* best effort */ }
 
 module.exports = {
   version,
+
+  // ── CALL ATTESTATIONS (Step 6 — caller+callee co-sign call facts; shadow mode) ──
+  buildCallAttestationPayload: attestation.buildCallAttestationPayload,
+  verifyCallAttestation: attestation.verifyCallAttestation,
+  verifyCallAttestationSet: attestation.verifyCallAttestationSet,
 
   // ── VERIFY + REPLAY (on-chain payment proof; native + HE-token) ──
   verifyPayment: verify.verifyPayment,

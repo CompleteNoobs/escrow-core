@@ -155,7 +155,7 @@ function createV4callAdapter({ account, currency, keyEnv } = {}) {
      * @param now             epoch ms (settlement clock)
      * @param maxDurationMin  the node's MAX_CALL_DURATION_MIN (metering clamp)
      */
-    buildCallEndReportFacts({ payRows, endReason = 'unknown', now, maxDurationMin } = {}) {
+    buildCallEndReportFacts({ payRows, endReason = 'unknown', now, maxDurationMin, attestations } = {}) {
       const rows = Array.isArray(payRows) ? payRows : [];
       const primary = rows.find(r => r.rate_per_hour != null) || rows[0] || {};
       const currency = primary.currency || this.currency;
@@ -185,7 +185,14 @@ function createV4callAdapter({ account, currency, keyEnv } = {}) {
         memo: r.memo,
         currency: r.currency || currency,
       }));
-      return { kind: 'call-end', endReason, endedAt: now || null, durationMs, currency, callFacts, payments };
+      const facts = { kind: 'call-end', endReason, endedAt: now || null, durationMs, currency, callFacts, payments };
+      // Step 6 — caller/callee call attestations (shadow mode). Carried VERBATIM inside
+      // the node-signed report envelope (tamper-evident in transit); the box verifies
+      // each user signature INDEPENDENTLY against on-chain posting keys, so these are
+      // trust-bearing even though the node assembled them. Absent = pre-attestation
+      // client or user declined to sign — shadow mode logs, never blocks.
+      if (Array.isArray(attestations) && attestations.length) facts.attestations = attestations;
+      return facts;
     },
 
     /**
