@@ -132,3 +132,23 @@ test('Decision #3 — 3dp currency matches ipfs-gate; an 8dp token neither stran
   // Over-precision is clamped to the token's places (chain would reject otherwise).
   assert.equal(settle({ deposit: 1, meteredUsage: 0.123456789, currency: 'SWAP.TINY' }).settlement, 0.12345679);
 });
+
+// ── resolvePrecision (index-level compose: registry cache + HE lookup) ───────
+const escrowCoreIndex = require('../index');
+const testMod = require('node:test');
+const assertMod = require('node:assert/strict');
+
+testMod('resolvePrecision: native from registry; unknown token looked up ONCE then cached; failure falls back uncached', async () => {
+  assertMod.equal(await escrowCoreIndex.resolvePrecision('HBD'), 3);
+  let lookups = 0;
+  const lookup = async () => { lookups++; return 8; };
+  assertMod.equal(await escrowCoreIndex.resolvePrecision('RPTOK8', { lookup }), 8);
+  assertMod.equal(await escrowCoreIndex.resolvePrecision('RPTOK8', { lookup }), 8, 'registry hit');
+  assertMod.equal(lookups, 1, 'HE lookup happened exactly once');
+  // failed lookup → default, NOT cached (a later call retries)
+  let fails = 0;
+  const failing = async () => { fails++; throw new Error('nope'); };
+  assertMod.equal(await escrowCoreIndex.resolvePrecision('RPTOKX', { lookup: failing }), 3);
+  assertMod.equal(await escrowCoreIndex.resolvePrecision('RPTOKX', { lookup: failing }), 3);
+  assertMod.equal(fails, 2, 'failure is not cached — retried on the next call');
+});

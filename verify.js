@@ -272,6 +272,29 @@ async function verifySidechain(txId, { retries = PAYMENT_VERIFY_RETRIES, delayMs
   return { confirmed: false, reason: 'pending', logs: null };
 }
 
+/**
+ * A Hive-Engine token's on-chain precision (decimal places), from the tokens table.
+ * Returns an integer 0..8, or throws (unknown token / network). Callers cache via
+ * settle.registerPrecision — see index.resolvePrecision.
+ */
+async function getTokenPrecision(symbol) {
+  const sym = String(symbol || '').toUpperCase();
+  const res = await fetch(HIVE_ENGINE_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'findOne', params: { contract: 'tokens', table: 'tokens', query: { symbol: sym } }, id: 1 }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`Hive-Engine HTTP ${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(`Hive-Engine: ${JSON.stringify(data.error)}`);
+  const p = data.result && Number(data.result.precision);
+  if (!Number.isInteger(p) || p < 0 || p > 8) {
+    throw Object.assign(new Error(`unknown token or bad precision for ${sym}`), { code: 'unprocessable_entity' });
+  }
+  return p;
+}
+
 /** Hive-Engine token balance for an account (Number). */
 async function getHiveEngineBalance(account, symbol) {
   const res = await fetch(HIVE_ENGINE_API, {
@@ -369,6 +392,7 @@ module.exports = {
   verifyPayment,
   verifySidechain,
   getHiveEngineBalance,
+  getTokenPrecision,
   getAccountPostingPubkeys,
   findOutgoingByMemo,
   isNativeCurrency,

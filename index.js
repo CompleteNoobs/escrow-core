@@ -30,7 +30,30 @@ module.exports = {
   verifySidechain: verify.verifySidechain,
   getAccountPostingPubkeys: verify.getAccountPostingPubkeys,
   findOutgoingByMemo: verify.findOutgoingByMemo,
+  getTokenPrecision: verify.getTokenPrecision,
   isNativeCurrency: verify.isNativeCurrency,
+
+  /**
+   * Resolve (and cache) a currency's true on-chain precision. Native HIVE/HBD and
+   * already-registered currencies answer from the registry; an unknown HE token is
+   * looked up once on Hive-Engine (tokens table) and registered, so every later
+   * precision()/roundCoins() call — including the sync placesFor paths — sees the
+   * real value instead of the 3dp default. Fail-safe: on lookup failure returns the
+   * registry default (3) WITHOUT caching, so a later call retries the lookup.
+   * @param deps.lookup  injectable precision fetcher (tests); default getTokenPrecision
+   */
+  async resolvePrecision(currency, deps = {}) {
+    const cur = String(currency || '').toUpperCase();
+    if (!cur || verify.isNativeCurrency(cur) || settle.PRECISION.has(cur)) return settle.precision(cur);
+    try {
+      const p = await (deps.lookup || verify.getTokenPrecision)(cur);
+      settle.registerPrecision(cur, p);
+      return p;
+    } catch (e) {
+      console.warn(`[escrow] resolvePrecision(${cur}) lookup failed — using default ${settle.precision(cur)}dp this time: ${e.message}`);
+      return settle.precision(cur);
+    }
+  },
 
   // ── SIGN (custodial disburse) ──
   disburse: sign.disburse,
