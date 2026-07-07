@@ -27,9 +27,11 @@ const dhive = require('@hiveio/dhive');
 const HIVE_NODE_FALLBACK = [
   'https://api.hive.blog',
   'https://api.deathwing.me',
-  'https://hive-api.arcange.eu',
+  'https://rpc.mahdiyari.info',
   'https://api.openhive.network',
   'https://techcoderx.com',
+  // hive-api.arcange.eu removed 2026-07-07 — consistently ETIMEDOUT from the escrow
+  // box AND the dev box; a 10s timeout per dead node stalls every disburse retry.
 ];
 const HIVE_ENGINE_API = 'https://api.hive-engine.com/rpc/contracts';
 const HIVE_ENGINE_BLOCKCHAIN_API = 'https://api.hive-engine.com/rpc/blockchain';
