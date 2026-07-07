@@ -15,7 +15,7 @@ This guide walks through '''escrow-core''' — the shared custodial-escrow '''li
 
 '''Source of truth''': <code>handover-decoupling.md</code> (§8 the data verdict, the spike result) and <code>handover-escrow-core.md</code> (the focused build brief) in the project root.
 
-'''End result''': escrow-core installed, its '''67 tests passing offline''', the API understood, and a clear picture of how v4call-node consumes it in-process today and how the isolated <code>v4call-escrow</code> box will consume it later.
+'''End result''': escrow-core installed, its '''80 tests passing offline''', the API understood, and a clear picture of both consumption modes: v4call-node in-process (<code>ESCROW_MODE=in-process</code>) and the isolated <code>v4call-escrow</code> box (<code>ESCROW_MODE=box</code> — the production setup: keyless node, box as settlement authority).
 
 == Contents ==
 
@@ -131,7 +131,7 @@ This is the single most important step. escrow-core's tests are written with '''
 
  npm test
 
-Under the hood this runs <code>node --test test/</code>. Expect '''67 passing''' assertions across 8 files:
+Under the hood this runs <code>node --test test/</code>. Expect '''80 passing''' assertions across 8 files:
 
 {| class="wikitable"
 |-
@@ -252,7 +252,7 @@ Right now escrow-core is consumed '''in-process''' by v4call-node — it is a de
 ;The escrow-protocol seam is already in place
 : Settlement is already expressed as a node→escrow signed <code>event-report</code> and an escrow→node signed <code>settlement-receipt</code> (the node's Nostr key, with <code>createSeenIds</code> dedup). In-process, the reporter signs '''and''' verifies with the same key, so settlement is guarded only by the durable ledger (a seam bug can't strand money). On the isolated box, <code>verifyReport</code> / <code>markSeen</code> become hard gates — a one-line change. This is why the box move is a '''transport swap''', not a rewrite.
 ;Verify it yourself
-: <code>cd v4call-node && npm test</code> → '''40 passing''' (unit per paid path, replay, crash-mid-settle, the cap, precision). escrow-core's own 67 stay green alongside.
+: <code>cd v4call-node && npm test</code> → '''55 passing''' (unit per paid path, replay, crash-mid-settle, the cap, precision, box-mode loopbacks). escrow-core's own 80 stay green alongside.
 
 For the operator-facing side of running v4call-node (env, Nginx, SSL, client wiring), see the '''v4call-node''' <code>walkthrough.wiki</code>.
 
@@ -397,9 +397,9 @@ You can't — and shouldn't try to improvise it. escrow-core is a library; the i
 == Quick Reference ==
 
 ;Install + prove
-: <code>npm install</code> then <code>npm test</code> → expect '''67 passing''', fully offline.
+: <code>npm install</code> then <code>npm test</code> → expect '''80 passing''', fully offline.
 ;Verify the consumer too
-: <code>cd ../v4call-node && npm test</code> → expect '''40 passing'''.
+: <code>cd ../v4call-node && npm test</code> → expect '''55 passing'''.
 ;The two invariants
 : '''Replay''' — <code>tx_id UNIQUE</code>, <code>recordPayment</code> throws <code>conflict</code>. '''Cap''' — <code>settle = min(usage, deposit)</code>, <code>atomicClose</code> single-winner.
 ;The two adapter seams

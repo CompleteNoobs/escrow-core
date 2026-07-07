@@ -25,9 +25,16 @@ small **adapters**, never in `if (service === …)`  branches.
 // VERIFY + REPLAY (native HIVE/HBD + Hive-Engine token; tx_id-anchored, exact-memo)
 verifyPayment({ txId, sender, account, currency, expectedMemo, expectedAmount }) → { paid, blockNum, confirmed, … }
 verifySidechain(txId)                                  // Hive-Engine hard-confirm (HE tokens)
+findOutgoingByMemo(account, memo, currency)            // idempotency probe for disburse retries:
+                                                       //   found (already sent) | not_found | error (UNKNOWN — don't re-broadcast)
 
 // SIGN (custodial disburse; native + HE token, per-currency precision)
-disburse({ to, amount, currency, memo, fromAccount, keyEnv }) → { txId, currency } | throws code:'no_key'
+disburse({ to, amount, currency, memo, fromAccount, keyEnv }) → { txId, currency }
+//   throws code:'no_key' (record pending) · code:'transient' (network — leave pending, retry via the probe)
+//   · permanent errors as-is (mark failed). Broadcasts via nativeBroadcast: OFFLINE dhive signing +
+//   native-fetch JSON-RPC with multi-node failover (dhive's bundled node-fetch is broken on some hosts;
+//   a cross-node 'duplicate transaction' answer is success — same signed tx ⇒ same tx id).
+classifyBroadcastError(err) → 'transient' | 'permanent'
 
 // SETTLE (the cap + per-currency precision — Decision #3)
 settle({ deposit, meteredUsage, dustFloor, currency, places }) → { settlement, refund, dust }
@@ -47,7 +54,8 @@ verifyHiveSig(messageBytes, sig, pubKey) · normalizeReleasePolicy(policy)
 // policy types: owner_only · any_of · all_of · duration_elapsed (v4call)
 
 // ESCROW-PROTOCOL 0.1 (node↔escrow, Nostr schnorr — distinct from the Hive release-sig layer)
-buildEventReport(...) · buildSettlementReceipt(...)    // canonical payloads
+buildEventReport(...) · buildSettlementReceipt(...)    // canonical payloads; receipts carry an optional
+                                                       // `reason` (failure detail on status:'failed')
 signReport(payload, skHex) · verifyReport(signed, expectedPubkey?) · getReportingPubkey(skHex)
 buildMemo({ namespace, purpose, reservationId }) · parseMemo(memo) · createSeenIds(max)
 
@@ -87,11 +95,14 @@ test/*.test.js      — node --test, ipfs-gate behaviour as the spec
 
 ```
 npm install        # better-sqlite3 (native) + @noble/curves (schnorr) + @hiveio/dhive
-npm test           # node --test test/
+npm test           # node --test test/ — 80 passing (Node 20; on Node 24 use node --test test/*.test.js)
+node scripts/dry-run-adversarial.js   # replay + crash-no-double-disburse harness — 13/13
 ```
 
 - **Source of truth:** `../handover-decoupling.md`; focused brief `../handover-escrow-core.md` +
   `../handover-escrow-core-api-refactor.md`.
-- NOT yet done (separate, separately-gated): the **v4call escrow-migration** (rewiring v4call-node's handlers onto
-  this core + durable rows — Decision #2) and the **v4call-escrow TEST-token dry-run** before any prod node points at it.
+- **Both gated phases are DONE and live** (2026-07): the v4call escrow-migration (v4call-node runs on this core;
+  durable rows are the settlement authority) and the isolated `v4call-escrow` box — production node
+  `node.v4call.com` runs **keyless** (`ESCROW_MODE=box`) and real TEST-token sessions (paid DMs + v0.17 paid
+  expert invites) settle through the box: verify → cap → split → disburse, envelope conserved.
 ```
