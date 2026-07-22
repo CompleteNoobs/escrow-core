@@ -19,6 +19,7 @@ const protocol = require('./escrow-protocol');
 const attestation = require('./attestation');
 const adapter = require('./adapter');
 const { createV4callAdapter } = require('./adapters/v4call');
+const { createIpfsGateAdapter } = require('./adapters/ipfs-gate');
 
 let version = '0.1.0';
 try { version = require('./package.json').version; } catch { /* best effort */ }
@@ -97,7 +98,8 @@ module.exports = {
   // ── ADAPTERS (the small per-service seam) ──
   validateAdapter: adapter.validateAdapter,
   createV4callAdapter,
-  adapters: { v4call: createV4callAdapter },
+  createIpfsGateAdapter,
+  adapters: { v4call: createV4callAdapter, ipfsGate: createIpfsGateAdapter },
 
   // ── Full module surfaces (escape hatch for internals/tests) ──
   modules: { verify, sign, settle, ledger, release, protocol, adapter },
