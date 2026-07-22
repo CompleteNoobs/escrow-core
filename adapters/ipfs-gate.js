@@ -60,10 +60,14 @@ const LEDGER_SCHEMA = `
   ALTER TABLE payments ADD COLUMN settle_trigger   TEXT;
 `;
 
-// The monolith's broadcastRefund `reason` strings (server.js:272-290), reused
-// verbatim as the report's `trigger` so node and box speak the same vocabulary.
+// The monolith's broadcastRefund `reason` strings (server.js settleClaimRefund /
+// settleForcedRefund call sites), reused verbatim as the report's `trigger` so
+// node and box speak the same vocabulary. Any UNKNOWN trigger falls through to
+// the default metering (dormant → fee, active → pro-rata) — the same refund the
+// monolith computes for every user-initiated end — so a future reason string
+// keeps working without an adapter change (and the settle cap bounds it anyway).
 const TRIGGERS = Object.freeze([
-  'cancel', 'release', 'delete',            // user-initiated, active claim → pro-rata
+  'cancel', 'user_deleted', 'released', 'released-via-receipt',  // user-initiated, active → pro-rata
   'dormant_cancel',                         // user cancels a dormant guardian → fee only
   'admin_void_innocent_guardian',           // CID ban voided an innocent pledge → full back
   'admin_void_forfeit',                     // refund_policy 'none' → escrow keeps all

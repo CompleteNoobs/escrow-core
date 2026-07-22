@@ -66,10 +66,10 @@ test('active pro-rata cancel reproduces the monolith refund (golden: 190 of 240)
   assert.equal(s.settlement, 50);                    // 10h × 5MB × 1 × 1 consumed
 });
 
-test('release and delete triggers meter identically to cancel', () => {
+test('every user-initiated trigger (and unknown future ones) meters like cancel', () => {
   const a = createIpfsGateAdapter();
   const claim = activeClaim();
-  for (const t of ['release', 'delete']) {
+  for (const t of ['user_deleted', 'released', 'released-via-receipt', 'some_future_reason']) {
     assert.equal(settleFor(a, claim, t).refund, 190, t);
   }
 });
@@ -251,7 +251,7 @@ test('buildClaimSettleReportFacts: full envelope, synthetic whitelist rows filte
 
 test('report trigger vocabulary is exactly broadcastRefund\'s reason strings', () => {
   assert.deepEqual([...TRIGGERS], [
-    'cancel', 'release', 'delete', 'dormant_cancel',
+    'cancel', 'user_deleted', 'released', 'released-via-receipt', 'dormant_cancel',
     'admin_void_innocent_guardian', 'admin_void_forfeit', 'admin_void_prorata',
   ]);
 });
